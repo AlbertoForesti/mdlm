@@ -15,8 +15,12 @@ import requests
 import tokenizers
 import torch
 import transformers
+import numpy as np
 
 import utils
+import hydra
+
+from itertools import cycle
 
 LOGGER = utils.get_logger(__name__)
 
@@ -101,6 +105,33 @@ def scientific_papers_detokenizer(x):
   x = wt_detokenizer(x)
   x = lm1b_detokenizer(x)
   return x
+
+class IdentityTokenizer(transformers.PreTrainedTokenizer):
+  def __init__(
+      self,
+      vocab_size):
+    self._vocab_size = vocab_size
+    super().__init__()
+  
+  def _tokenize(self, data, **kwargs):
+    return data
+  
+  def _convert_token_to_id(self, token):
+    return token
+  
+  def _convert_id_to_token(self, index):
+    return index
+  
+  def convert_tokens_to_string(self, tokens):
+    return ''.join(str(tokens))
+  
+  def get_vocab(self):
+    return {str(i): i for i in range(self.vocab_size)}
+  
+  @property
+  def vocab_size(self):
+    return self._vocab_size
+    
 
 
 class Text8Tokenizer(transformers.PreTrainedTokenizer):
@@ -299,10 +330,94 @@ def _group_texts(examples, block_size, bos, eos):
   result['attention_mask'] = _attn_masks
   return result
 
+def get_summarization_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
+    field_size_dict, block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+  assert sum(list(field_size_dict.values())) == block_size - len(field_size_dict), f"Total field size must be {block_size - len(field_size_dict) - 1}, instead got {list(field_size_dict.values())} with sum {sum(list(field_size_dict.values()))}"
+  field_length_str = '_'.join(
+      [f'{k}{v}' for k, v in field_size_dict.items()])
+  if wrap:
+    filename = f'{dataset_name.replace("/","")}_{mode}_bs{block_size}_{field_length_str}_wrapped.pt'
+  else:
+    filename = f'{dataset_name.replace("/","")}_{mode}_bs{block_size}_{field_length_str}_unwrapped.pt'
+  _path = os.path.join(cache_dir, filename)
+  if utils.fsspec_exists(_path) and False:
+    LOGGER.info(f'Loading data from: {_path}')
+    return torch.load(_path)
+  LOGGER.info(f'Generating new data at: {_path}')
+
+  if 'multi_news' in dataset_name:
+    dataset = datasets.load_dataset(
+      dataset_name,
+      cache_dir=cache_dir,
+      streaming=streaming,
+      trust_remote_code=True)
+  EOS = tokenizer.encode(tokenizer.eos_token)[0]
+  BOS = tokenizer.encode(tokenizer.bos_token)[0]
+  def preprocess_and_tokenize(example, field, max_field_length):
+    if 'multi_news' in dataset_name:
+      text = example[field]
+      
+    tokenizer.padding_side = 'right'
+    tokenizer.truncation_side = 'right'
+
+    if wrap:
+      tokens = tokenizer(text,
+                         add_special_tokens=False,
+                         return_attention_mask=False,
+                         return_token_type_ids=False)
+      tokens = {'input_ids':
+                [t + [EOS] for t in tokens['input_ids']]}
+      # Still missing BOS, but will be added in group_texts
+    else:
+      try:
+        tokens = tokenizer(text,
+                         max_length=max_field_length,
+                         padding='max_length',
+                         truncation=True,
+                         add_special_tokens=True,
+                         return_attention_mask=True,
+                         return_token_type_ids=True,)
+        tokens = {'input_ids':
+                [t + [EOS] for t in tokens['input_ids']]}
+        # print(len(tokens['input_ids']))
+      except:
+        raise ValueError(f'Error tokenizing: {text}')
+    return tokens
+  data = dataset[mode]
+  tokenized_datasets_by_field = {}
+  for field, max_field_length in field_size_dict.items():
+    preprocess_and_tokenize_field = functools.partial(
+      preprocess_and_tokenize, field=field, max_field_length=max_field_length)
+    if streaming:
+      tokenized_dataset = data.map(
+        preprocess_and_tokenize_field,
+        batched=True,
+        desc='Tokenizing')
+    else:
+      tokenized_dataset = data.map(
+        preprocess_and_tokenize_field,
+        batched=True,
+        num_proc=num_proc,
+        load_from_cache_file=True,
+        desc='Tokenizing')
+    tokenized_datasets_by_field[field] = tokenized_dataset
+  
+  tokenized_dataset = ConcatenatedDataset(
+    tokenized_datasets_by_field)
+  torch.save(tokenized_dataset, _path)
+  return tokenized_dataset
+
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None):
+  
+  if 'multi_news' in dataset_name:
+    assert field_size_dict is not None, f"field_size_dict must be provided for {dataset_name} dataset"
+    return get_summarization_dataset(
+      dataset_name, tokenizer, wrap, mode, cache_dir,
+      field_size_dict=field_size_dict, block_size=block_size, num_proc=num_proc, streaming=streaming)
+
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
@@ -410,9 +525,6 @@ def get_dataset(
       text = example['sentence']
     elif 'scientific_papers' in dataset_name:
       text = example['article']
-    else:
-      text = example['text']
-    
     if detokenizer is not None:
       text = _apply_detokenizer(detokenizer)(text)
 
@@ -428,13 +540,17 @@ def get_dataset(
                 [t + [EOS] for t in tokens['input_ids']]}
       # Still missing BOS, but will be added in group_texts
     else:
-      tokens = tokenizer(text,
+      try:
+        tokens = tokenizer(text,
                          max_length=block_size,
                          padding='max_length',
                          truncation=True,
                          add_special_tokens=True,
                          return_attention_mask=True,
-                         return_token_type_ids=True)
+                         return_token_type_ids=True,)
+        # print(len(tokens['input_ids']))
+      except:
+        raise ValueError(f'Error tokenizing: {text}')
     return tokens
 
   if streaming:
@@ -458,6 +574,9 @@ def get_dataset(
   elif dataset_name == 'ag_news':
     tokenized_dataset = tokenized_dataset.remove_columns(
       ['text', 'label'])
+  elif 'multi_news' in dataset_name:
+    tokenized_dataset = tokenized_dataset.remove_columns(
+      ['document', 'summary'])
   else:
     tokenized_dataset = tokenized_dataset.remove_columns(
       'text')
@@ -465,7 +584,6 @@ def get_dataset(
   if not wrap:
     tokenized_dataset.save_to_disk(_path)
     return tokenized_dataset.with_format('torch')
-
   group_texts = functools.partial(
     _group_texts, block_size=block_size, bos=BOS, eos=EOS)
   if streaming:
@@ -486,6 +604,10 @@ def get_dataset(
 
 
 def get_tokenizer(config):
+  if "synthetic" in config.data.train:
+    tokenizer = IdentityTokenizer(
+      vocab_size=config.data.random_variable.dim)
+    return tokenizer
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
@@ -520,7 +642,6 @@ def get_tokenizer(config):
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
   return tokenizer
-    
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
@@ -540,16 +661,23 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     raise ValueError(
       f'Eval Batch Size for {config.eval.batch_size} '
       f'not divisible by {num_gpus}.')
+  if "synthetic" in config.data.train:
+    return get_synthetic_dataloaders(config, tokenizer)
   if skip_train:
     train_set = None
   else:
+    if hasattr(config.data, 'field_size_dict'):
+      field_size_dict = config.data.field_size_dict
+    else:
+      field_size_dict = None
     train_set = get_dataset(
       config.data.train,
       tokenizer,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length)
+      block_size=config.model.length,
+      field_size_dict=field_size_dict,)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -558,6 +686,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   if skip_valid:
     valid_set = None
   else:
+    if hasattr(config.data, 'field_size_dict'):
+      field_size_dict = config.data.field_size_dict
+    else:
+      field_size_dict = None
     valid_set = get_dataset(
       config.data.valid,
       tokenizer,
@@ -565,7 +697,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      streaming=False)
+      field_size_dict=field_size_dict,
+      streaming=False,)
 
   if skip_train:
     train_loader = None
@@ -594,11 +727,136 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
       generator=generator)
+    if config.eval.compute_mutinfo:
+      valid_loader = InfiniteDataLoader(valid_loader)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
 
   return train_loader, valid_loader
 
+class InfiniteDataLoader:
+  def __init__(self, dataloader):
+      self.dataloader = dataloader
+      self.iterator = cycle(dataloader)
+
+  def __iter__(self):
+      return self
+
+  def __next__(self):
+      return next(self.iterator)
+  
+  def __len__(self):
+      return np.inf
+  
+  @property
+  def dataset(self):
+      return self.dataloader.dataset
+
+class ConcatenatedDataset(torch.utils.data.Dataset):
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self._var_indices = None
+
+    def __len__(self):
+        return len(next(iter(self.datasets.values())))
+
+    def __getitem__(self, idx):
+        input_ids_list = []
+        attention_mask_list = []
+
+        for dataset in self.datasets.values():
+            item = dataset[idx]
+            input_ids_list.extend(item['input_ids'])
+            if 'attention_mask' in item:
+                attention_mask_list.append(torch.tensor(item['attention_mask']))
+
+        input_ids = torch.tensor(input_ids_list)
+        if attention_mask_list:
+            try:
+              attention_mask = torch.cat(attention_mask_list, dim=0)
+            except:
+              raise ValueError(f'attention_mask_list: {attention_mask_list}')
+        else:
+            attention_mask = torch.ones_like(input_ids)
+
+        return {'input_ids': input_ids, 'attention_mask': attention_mask}
+
+    @property
+    def var_indices(self):
+      if self._var_indices is not None:
+        return self._var_indices
+      self._var_indices = []
+      for dataset in self.datasets.values():
+        example = dataset[0]['input_ids']
+        if len(self._var_indices) == 0:
+          self._var_indices.append(list(range(len(example))))
+        else:
+          self._var_indices.append(list(
+            range(self._var_indices[-1][-1] + 1, self._var_indices[-1][-1] + 1 + len(example))))
+      return self._var_indices
+
+class SyntheticDataset(torch.utils.data.Dataset):
+    def __init__(self, data):
+      # check data is iterable
+      assert hasattr(data, '__iter__'), 'Data must be iterable.'
+      self.data = torch.cat(data, dim=1)
+      self._var_indices = []
+      for var in data:
+        if len(self._var_indices) == 0:
+          self._var_indices.append(list(range(var.shape[1])))
+        else:
+          self._var_indices.append(list(
+            range(self._var_indices[-1][-1] + 1, self._var_indices[-1][-1] + 1 + var.shape[1])))
+    
+    def __len__(self):
+      return len(self.data)
+    
+    def __getitem__(self, idx):
+      return {'input_ids': self.data[idx], 'attention_mask': torch.ones_like(self.data[idx])}
+    
+    @property
+    def var_indices(self):
+      return self._var_indices
+
+def get_synthetic_dataloaders(config, tokenizer):
+
+  random_variable = hydra.utils.instantiate(
+    config.data.random_variable)
+  
+  x_train, y_train = random_variable.rvs(
+    config.data.train_size)
+
+  xy_train = (
+    torch.tensor(x_train, dtype=torch.long),
+    torch.tensor(y_train, dtype=torch.long
+    ))
+
+  x_valid, y_valid = random_variable.rvs(
+    config.data.valid_size)
+  
+  xy_valid = (
+    torch.tensor(x_valid, dtype=torch.long),
+    torch.tensor(y_valid, dtype=torch.long))
+  
+  train_loader = torch.utils.data.DataLoader(
+    SyntheticDataset(xy_train),
+    batch_size=config.loader.batch_size,
+    num_workers=config.loader.num_workers,
+    pin_memory=config.loader.pin_memory,
+    shuffle=True)
+  train_loader.tokenizer = tokenizer
+
+  valid_loader = torch.utils.data.DataLoader(
+    SyntheticDataset(xy_valid),
+    batch_size=config.loader.eval_batch_size,
+    num_workers=config.loader.num_workers,
+    pin_memory=config.loader.pin_memory,
+    shuffle=False)
+  if config.eval.compute_mutinfo:
+    valid_loader = InfiniteDataLoader(valid_loader)
+  valid_loader.tokenizer = tokenizer
+
+  return train_loader, valid_loader
 
 # Samplers adapted from: https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/fault_tolerant_sampler.py
 

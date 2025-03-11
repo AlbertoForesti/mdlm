@@ -18,6 +18,8 @@ import models
 import noise_schedule
 import utils
 
+from dataclasses import asdict
+
 LOG2 = math.log(2)
 
 
@@ -92,6 +94,9 @@ class Diffusion(L.LightningModule):
     if self.config.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
+    if self.config.backbone == 'unetmlp':
+      self.backbone = models.unetmlp.UnetMLP(
+        self.config, vocab_size=self.vocab_size)
     elif self.config.backbone == 'dimamba':
       self.backbone = models.dimamba.DiMamba(
         self.config,
@@ -103,8 +108,11 @@ class Diffusion(L.LightningModule):
         vocab_size=self.vocab_size,
         mask_index=self.mask_index)
     elif self.config.backbone == 'hf_dit':
-      self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
+      try:
+        self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
+      except:
+        raise ValueError(f"Could not load model from {config.eval.checkpoint_path}")
     else:
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
@@ -119,10 +127,18 @@ class Diffusion(L.LightningModule):
       'bpd': BPD(),
       'ppl': Perplexity(),
     })
+    info_metrics = torchmetrics.MetricCollection({
+      'entropy': torchmetrics.aggregation.MeanMetric(),
+      'mutinfo': torchmetrics.aggregation.MeanMetric(),
+    })
     metrics.set_dtype(torch.float64)
     self.train_metrics = metrics.clone(prefix='train/')
     self.valid_metrics = metrics.clone(prefix='val/')
     self.test_metrics = metrics.clone(prefix='test/')
+
+    self.train_info_metrics = info_metrics.clone(prefix='train/')
+    self.valid_info_metrics = info_metrics.clone(prefix='val/')
+    self.test_info_metrics = info_metrics.clone(prefix='test/')
 
     # generative perplexity
     self.gen_ppl_metric = Perplexity()
@@ -155,9 +171,13 @@ class Diffusion(L.LightningModule):
   def _validate_configuration(self):
     assert not (self.change_of_variables
                 and self.importance_sampling)
+    if self.config.eval.compute_mutinfo or self.config.training.compute_mutinfo:
+      assert hasattr(self.config, 'mutinfo'), f"config: {self.config} does not have mutinfo"
+      assert hasattr(self.config.mutinfo, 'var_indices')
     if self.parameterization == 'sedd':
       assert not self.importance_sampling
       assert not self.change_of_variables
+      assert self.time_conditioning
     if self.parameterization == 'd3pm':
       assert self.T > 0
     if self.T > 0:
@@ -296,6 +316,13 @@ class Diffusion(L.LightningModule):
     # for the input word to 0.
     logits = torch.scatter(logits, -1, xt[..., None],
                            torch.zeros_like(logits[..., :1]))
+    if torch.isinf(logits).any():
+      raise ValueError(f'Sedd parametrization contains inf values:\n\
+                      log_score: {logits[:5]}\n\
+                      sigma: {sigma[:5]}\n\
+                      xt: {xt[:5]}\n\
+                      np.log(logits.shape[-1] - 1): {np.log(logits.shape[-1] - 1)}\n\
+                      esigm1_log: {esigm1_log[:5]}')
     return logits
 
   def _process_sigma(self, sigma):
@@ -313,7 +340,7 @@ class Diffusion(L.LightningModule):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
+      logits = self.backbone(x, sigma[:, None])
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
@@ -382,6 +409,218 @@ class Diffusion(L.LightningModule):
                   on_epoch=True,
                   sync_dist=True)
     return loss
+  
+  def _get_stage_config_from_prefix(self, prefix):
+    if prefix == 'train':
+      return self.config.training
+    elif prefix == 'val':
+      return self.config.eval
+    elif prefix == 'test':
+      return self.config.eval
+    else:
+      raise ValueError(f'Invalid prefix: {prefix}')
+  
+  @torch.no_grad()
+  def _compute_information_metrics(self, x0, prefix):
+    t = self._sample_t(x0.shape[0], x0.device)
+    if self.T > 0:
+      t = (t * self.T).to(torch.int)
+      t = t / self.T
+      # t \in {1/T, 2/T, ..., 1}
+      t += (1 / self.T)
+
+    if self.change_of_variables:
+      f_T = torch.log1p(- torch.exp(- self.noise.sigma_max))
+      f_0 = torch.log1p(- torch.exp(- self.noise.sigma_min))
+      move_chance = torch.exp(f_0 + t * (f_T - f_0))
+      move_chance = move_chance[:, None]
+    else:
+      sigma, dsigma = self.noise(t)
+      move_chance = 1 - torch.exp(-sigma[:, None])
+
+    xt = self.q_xt(x0, move_chance)
+
+    info_metrics = dict()
+
+    config = self._get_stage_config_from_prefix(prefix)
+    """se = self._score_entropy(self.get_score(xt, sigma[:, None], return_logscore=True), sigma[:, None], xt, x0)
+    se = dsigma[:,None]*se
+    se = se.sum(dim=-1)
+    se = se.mean().item()"""
+    
+    if config.compute_entropy:
+      info_metrics['entropy'] = self._entropy(x0, xt, sigma, dsigma)
+    else:
+      info_metrics['entropy'] = None
+
+    if config.compute_mutinfo:
+      info_metrics['mutinfo'] = self._mutinfo(x0, xt, sigma, dsigma)
+    else:
+      info_metrics['mutinfo'] = None
+    
+    if prefix == 'train':
+        if info_metrics["entropy"] is not None:
+            self.train_info_metrics['entropy'].update(info_metrics['entropy'])
+        if info_metrics["mutinfo"] is not None:
+            self.train_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
+    elif prefix == 'val':
+        if info_metrics["entropy"] is not None:
+            self.valid_info_metrics['entropy'].update(info_metrics['entropy'])
+        if info_metrics["mutinfo"] is not None:
+            self.valid_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
+    elif prefix == 'test':
+        if info_metrics["entropy"] is not None:
+            self.test_info_metrics['entropy'].update(info_metrics['entropy'])
+        if info_metrics["mutinfo"] is not None:
+            self.test_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
+    else:
+        raise NotImplementedError(f'Invalid prefix: {prefix}')
+    return info_metrics
+
+  def _entropy(self, x0, xt, sigma, dsigma):
+    log_score = self.get_score(xt, sigma[:,None], return_logscore=True)
+
+    rel_ind = xt == self.mask_index
+    esigm1 = torch.where(
+        sigma < 0.5,
+        torch.expm1(sigma),
+        torch.exp(sigma) - 1
+    )
+
+    xt = xt.unsqueeze(-1)
+    
+    # log_score = torch.scatter(log_score, -1, xt, torch.zeros_like(log_score))
+    # score = torch.scatter(log_score.exp(), -1, xt, torch.zeros_like(log_score))
+    score = log_score.exp()
+
+    esigm1 = esigm1.unsqueeze(-1).unsqueeze(-1)
+    ratio = 1 / esigm1.expand_as(score)
+    ratio = ratio/(self.vocab_size-1)
+
+    rel_ind = rel_ind.unsqueeze(-1).expand_as(score)
+
+    # constant term
+    const = score * (log_score - 1)
+    
+    pos_term = ratio
+    neg_term = score * ratio.log()
+
+    # unscaled_ret_value = pos_term - neg_term + const
+    unscaled_ret_value = pos_term - neg_term + const
+
+    xt = xt.squeeze(-1)
+
+    transp_rate = self._transp_rate(xt)
+    scale_factor = torch.scatter(transp_rate, -1, xt[...,None], torch.zeros_like(transp_rate))
+    scale_factor = scale_factor * dsigma[..., None, None]
+    # scale_factor = dsigma[..., None]
+
+    ret = scale_factor * unscaled_ret_value
+    ret = torch.where(rel_ind, ret, torch.zeros_like(ret))
+    ret = ret[:,:,:-1]
+
+    ret = ret.reshape(ret.shape[0], -1)
+    ret = ret.sum(dim=-1)
+
+    if np.random.rand() < 1e-3 and False:
+        print(f"score is {score[:5]}\
+              \n log_score is {log_score[:5]}\
+              \n rel_ind is {rel_ind[:5]}\
+              \n ret is {ret[:5]}\
+              \n ret.mean is {ret.mean()}\
+              \n x0 is {x0[:5]}\
+              \n xt is {xt[:5]}\
+              ******************************************\n")
+
+    return xt.shape[1]*np.log(self.vocab_size)-ret.mean().item()
+  
+  def _score_divergence(self, log_score_p, log_score_q, dsigma, x):
+
+    x = x.unsqueeze(-1)
+
+    score_p = torch.scatter(log_score_p.exp(), -1, x, torch.zeros_like(log_score_p))
+
+    score_q = torch.scatter(log_score_q.exp(), -1, x, torch.zeros_like(log_score_q))
+
+    neg_term = score_p * log_score_q
+
+    # constant factor
+    const = score_p * (log_score_p - 1)
+
+    #positive term
+    pos_term = score_q
+
+    unscaled_ret_value = pos_term - neg_term + const
+
+    transp_rate = self._transp_rate(x)
+    scale_factor = torch.scatter(transp_rate, -1, x[...,None], torch.zeros_like(transp_rate))
+
+    x = x.squeeze(-1)
+
+    transp_rate = self._transp_rate(x)
+    scale_factor = torch.scatter(transp_rate, -1, x[...,None], torch.zeros_like(transp_rate))
+    try:
+      scale_factor = scale_factor * dsigma[..., None]
+    except:
+      raise UserWarning(f"incompatible shapes: {scale_factor.shape}, {dsigma.shape}")
+
+    ret = scale_factor * unscaled_ret_value
+    ret = ret.reshape(ret.shape[0], -1)
+
+    ret = ret.sum(dim=-1)
+
+    return ret
+  
+  def _get_masks(self, x0):
+    return (self._get_mask_from_list_of_indices(x0, i) for i in self.config.mutinfo.var_indices)
+
+  def _get_mask_from_list_of_indices(self, x, indices):
+    mask = torch.zeros_like(x)
+    mask[:, indices] = 1
+    return mask.bool()
+  
+  def _get_conditioning_signals(self):
+    return tuple(range(len(self.config.mutinfo.var_indices)+1)) # for all the variables +1 for the joint
+
+  def _mutinfo(self, x0, xt, sigma, dsigma):
+    x_mask, y_mask = self._get_masks(x0)
+    joint_signal, x_signal, y_signal = self._get_conditioning_signals()
+    masked_batch = self.mask_index * torch.ones_like(x0)
+    xt_marginal_x = torch.where(y_mask, masked_batch, xt)
+    xt_marginal_y = torch.where(x_mask, masked_batch, xt)
+    log_score_marginal_x = self.get_score_with_signal(xt_marginal_x, sigma, x_signal, return_logscore=True)
+    log_score_marginal_y = self.get_score_with_signal(xt_marginal_y, sigma, y_signal, return_logscore=True)
+    log_score_joint = self.get_score_with_signal(xt, sigma, joint_signal, return_logscore=True)
+    x_mask_score_shape_broadcast = x_mask.unsqueeze(-1).expand_as(log_score_marginal_x)
+    log_score_marginal = torch.where(x_mask_score_shape_broadcast, log_score_marginal_x, log_score_marginal_y)
+    mutinfo = self._score_divergence(log_score_joint, log_score_marginal, dsigma[:,None], xt)
+    """print(f"DEBUG:\n\
+                      x_mask: {x_mask[:5]}\n\
+                      y_mask: {y_mask[:5]}\n\
+                      xt_marginal_x: {xt_marginal_x[:5]}\n\
+                      xt_marginal_y: {xt_marginal_y[:5]}\n\
+                      x_mask_score_shape_broadcast: {x_mask_score_shape_broadcast[:5]}\n\
+                      log_score_marginal_x: {log_score_marginal_x[:5]}\n\
+                      log_score_marginal_y: {log_score_marginal_y[:5]}\n\
+                      score_marginal: {log_score_marginal[:5]}\n\
+                      log_score_joint: {log_score_joint[:5]}\n\
+                      mutinfo: {mutinfo}\n\
+                      xt shape: {xt.shape}\n\
+                      sigma shape: {sigma.shape}\n\
+                      dsigma shape: {dsigma.shape}\n\
+                      x0 shape: {x0.shape}\n\
+                      x_mask shape: {x_mask.shape}\n\
+                      y_mask shape: {y_mask.shape}\n\
+                      x_mask_score_shape_broadcast shape: {x_mask_score_shape_broadcast.shape}\n\
+                      xt_marginal_x shape: {xt_marginal_x.shape}\n\
+                      xt_marginal_y shape: {xt_marginal_y.shape}\n\
+                      log_score_marginal_x shape: {log_score_marginal_x.shape}\n\
+                      log_score_marginal_y shape: {log_score_marginal_y.shape}\n\
+                      score_marginal shape: {log_score_marginal.shape}\n\
+                      log_score_joint shape: {log_score_joint.shape}\n\
+                      mutinfo shape: {mutinfo.shape}\n\
+                      ******************************************\n")"""
+    return mutinfo.mean().item()
 
   def on_train_epoch_start(self):
     self.backbone.train()
@@ -410,7 +649,12 @@ class Diffusion(L.LightningModule):
     assert self.valid_metrics.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
-    return self._compute_loss(batch, prefix='val')
+    loss = self._compute_loss(batch, prefix='val')
+    info_metrics = self._compute_information_metrics(batch['input_ids'], prefix='val')
+    return {
+      'loss': loss,
+      **info_metrics
+    }
 
   def on_validation_epoch_end(self):
     if ((self.config.eval.compute_perplexity_on_sanity
@@ -438,6 +682,19 @@ class Diffusion(L.LightningModule):
       if self.config.eval.compute_generative_perplexity:
         self.log('val/gen_ppl',
                  self.gen_ppl_metric,
+                 on_epoch=True,
+                 on_step=False,
+                 sync_dist=True)
+      if self.config.eval.compute_entropy:
+        print("Entropy is", self.valid_info_metrics['entropy'].compute())
+        self.log('val/entropy',
+                 self.valid_info_metrics['entropy'].compute(),
+                 on_epoch=True,
+                 on_step=False,
+                 sync_dist=True)
+      if self.config.eval.compute_mutinfo:
+        self.log('val/mutinfo',
+                 self.valid_info_metrics['mutinfo'].compute(),
                  on_epoch=True,
                  on_step=False,
                  sync_dist=True)
@@ -718,7 +975,7 @@ class Diffusion(L.LightningModule):
     self.noise.train()
     return samples
 
-  def get_score(self, x, sigma):
+  def get_score(self, x, sigma, return_logscore=False):
     model_output = self.forward(x, sigma)
     if self.parameterization == 'subs':
       # score(x, t) = p_t(y) / p_t(x)
@@ -741,7 +998,7 @@ class Diffusion(L.LightningModule):
       #     where k = exp(- sigma) / (1 - exp(- sigma))
       
       log_k = - torch.log(torch.expm1(sigma)).squeeze(-1)
-      assert log_k.ndim == 1
+      assert log_k.ndim == 1, f"Expected 1, got {log_k.ndim}, sigma {sigma.shape}, log_k {log_k.shape}, x {x.shape}"
       
       masked_score = model_output + log_k[:, None, None]
       masked_score[:, :, self.mask_index] = 0
@@ -761,7 +1018,19 @@ class Diffusion(L.LightningModule):
       model_output = (
         masked_score * masked_indices
         + unmasked_score * (1 - masked_indices))
+    if return_logscore:
+      return model_output
     return model_output.exp()
+  
+  def get_score_with_signal(self, x, sigma, signal, return_logscore=False):
+    """
+    Function for computing score conditioned on some signal.
+    Allow flexibility for different parameterizations. Some options:
+    - signal passed in the context
+    - signal as an extra parameter to the model, akin to time conditioning
+    - no signal
+    """
+    return self.get_score(x, sigma, return_logscore=return_logscore)
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()
@@ -795,6 +1064,11 @@ class Diffusion(L.LightningModule):
     edge += torch.where(i == self.mask_index,
                         1 - torch.exp(-sigma).squeeze(-1),
                         0)[..., None]
+    return edge
+  
+  def _transp_rate(self, i):
+    edge = -F.one_hot(i, num_classes=self.vocab_size)
+    edge[i == self.vocab_size - 1] += 1
     return edge
 
   def _sample_t(self, n, device):
@@ -868,8 +1142,9 @@ class Diffusion(L.LightningModule):
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
-      return dsigma[:, None] * self._score_entropy(
+      score_entropy = self._score_entropy(
         model_output, sigma[:, None], xt, x0)
+      return dsigma[:, None] * score_entropy
     
     if self.T > 0:
       diffusion_loss = self._d3pm_loss(
@@ -932,7 +1207,6 @@ class Diffusion(L.LightningModule):
       loss with shape (batch_size, diffusion_model_input_length)
     """
     masked_indices = xt == self.mask_index
-
     expsig_minus_1 = torch.expm1(sigma).expand_as(xt)
     q_ratio = 1 / expsig_minus_1[masked_indices]
 

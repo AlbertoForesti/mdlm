@@ -12,6 +12,9 @@ import dataloader
 import diffusion
 import utils
 
+from hydra.utils import instantiate
+import numpy as np
+
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -116,6 +119,34 @@ def generate_samples(config, logger, tokenizer):
           model.gen_ppl_metric.compute())
   return text_samples
 
+def info_eval(config, logger, tokenizer):
+  logger.info('Starting Information Metrics Eval.')
+  model = _load_from_checkpoint(config=config,
+                                tokenizer=tokenizer)
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+
+  wandb_logger = None
+  if config.get('wandb', None) is not None:
+    wandb_logger = L.pytorch.loggers.WandbLogger(
+      config=omegaconf.OmegaConf.to_object(config),
+      ** config.wandb)
+  callbacks = []
+  if 'callbacks' in config:
+    for _, callback in config.callbacks.items():
+      callbacks.append(hydra.utils.instantiate(callback))
+  trainer = hydra.utils.instantiate(
+    config.trainer,
+    default_root_dir=os.getcwd(),
+    callbacks=callbacks,
+    strategy=hydra.utils.instantiate(config.strategy),
+    logger=wandb_logger,
+    limit_val_batches=config.eval.mc_estimates)
+  _, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer, skip_train=True, valid_seed=config.seed)
+  trainer.validate(model, valid_ds)
+
 def _ppl_eval(config, logger, tokenizer):
   logger.info('Starting Zero Shot Eval.')
 
@@ -170,9 +201,20 @@ def _train(config, logger, tokenizer):
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
   _print_batch(train_ds, valid_ds, tokenizer)
-
+  if config.eval.compute_mutinfo or config.training.compute_mutinfo:
+    omegaconf.OmegaConf.update(config, "trainer.limit_val_batches", config.eval.mc_estimates, force_add=True)
+    if hasattr(train_ds.dataset, 'var_indices'):
+      # If dataset has var_indices, pass them to the model config
+      if omegaconf.OmegaConf.select(config, "mutinfo") is not None:
+          raise ValueError("config.mutinfo already exists.")
+      else:
+          omegaconf.OmegaConf.update(config, "mutinfo.var_indices", train_ds.dataset.var_indices, force_add=True)
+    else:
+      raise ValueError("Dataset does not have var_indices.")
+    
   model = diffusion.Diffusion(
     config, tokenizer=valid_ds.tokenizer)
+  
 
   trainer = hydra.utils.instantiate(
     config.trainer,
@@ -197,6 +239,8 @@ def main(config):
     generate_samples(config, logger, tokenizer)
   elif config.mode == 'ppl_eval':
     _ppl_eval(config, logger, tokenizer)
+  elif config.mode == 'info_eval':
+    info_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 

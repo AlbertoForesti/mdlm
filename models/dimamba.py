@@ -46,6 +46,7 @@ from models.dit import (
 # sys.path.append('mamba_wrappers/mamba2')
 # from .mamba2.src.modules.ssd import SSD as Mamba
 
+FLOAT_FORMAT = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 class Mamba(nn.Module):
     def __init__(
@@ -1130,7 +1131,7 @@ class DiMamba(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     if self.temb_strategy is not None:
       c = F.silu(self.sigma_map(sigma))
 
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    with torch.cuda.amp.autocast(dtype=FLOAT_FORMAT):
       x = self.model(indices, time_embeds=c).logits
 
     return x

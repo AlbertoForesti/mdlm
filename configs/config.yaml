@@ -2,16 +2,16 @@ defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
   - /data: openwebtext
-  - /model: small
+  - /model: medium
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
 
-mode: train  # train / ppl_eval / sample_eval
+mode: train  # train / ppl_eval / sample_eval / info_eval
 diffusion: absorbing_state
-backbone: dit  # dit / dimamba / ar
+backbone: dit  # dit / dimamba / ar / unetmlp
 parameterization: subs  # subs / d3pm / sedd
-time_conditioning: False
+time_conditioning: True
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
 
@@ -43,6 +43,8 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  compute_entropy: True
+  compute_mutinfo: True
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
@@ -52,6 +54,9 @@ eval:
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
+  mc_estimates: 100
+  compute_entropy: True
+  compute_mutinfo: True
 
 optim:
   weight_decay: 0
@@ -67,20 +72,20 @@ trainer:
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: '16' # bf16
   num_sanity_val_steps: 2
   max_steps: 1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 10000
+  check_val_every_n_epoch: 20
 
 wandb:
   project: text-diffusion
   notes: Mulan for text
   group: null
   job_type: null
-  name: null
+  name: debug_${now:%Y.%m.%d}_${now:%H%M%S}
   id: ${.name}_${seed}
   tags:
     - ${noise.type}

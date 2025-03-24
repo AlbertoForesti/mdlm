@@ -149,3 +149,24 @@ class LogLinearNoise(Noise):
     sigma_t = - torch.log1p(- torch.exp(t * f_T + (1 - t) * f_0))
     t = - torch.expm1(- sigma_t) / (1 - self.eps)
     return t
+
+class LearnableNoise(Noise):
+
+  def __init__(self, base_noise, vocab_size):
+    super().__init__()
+    self.base_noise = base_noise
+    self.noise = nn.Parameter(torch.zeros(vocab_size))
+    self.vocab_size = vocab_size
+  
+  def total_noise(self, t):
+    assert t.ndim == 1, 't should be a 1D tensor'
+    total_noise = self.base_noise.total_noise(t)
+    total_noise = total_noise.unsqueeze(0).expand(t.size(0), self.vocab_size)
+    total_noise = total_noise * torch.sigmoid(self.noise).unsqueeze(0).expand(t.size(0), self.vocab_size)
+    return total_noise
+  
+  def rate_noise(self, t, eps=1e-3):
+    rate_noise = self.total_noise(t+eps) - self.total_noise(t)
+    return rate_noise / eps
+    
+  

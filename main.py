@@ -13,6 +13,7 @@ import diffusion
 import utils
 
 from hydra.utils import instantiate
+from datetime import datetime
 import numpy as np
 
 omegaconf.OmegaConf.register_new_resolver(
@@ -23,6 +24,7 @@ omegaconf.OmegaConf.register_new_resolver(
   'eval', eval)
 omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
+omegaconf.OmegaConf.register_new_resolver("model_length", lambda seq_length: 2 * int(seq_length))
 
 
 def _load_from_checkpoint(config, tokenizer):
@@ -180,10 +182,39 @@ def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
   if config.get('wandb', None) is not None:
+    # Create a unique name for the W&B run in multirun mode
+    wandb_config = dict(config.wandb)
+    
+    # Generate a unique name that includes run parameters (for multirun)
+    base_name = wandb_config.pop("name", f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    
+    # Add a unique identifier - combine timestamp with random string
+    import uuid
+    unique_id = str(uuid.uuid4())[:8]
+    job_id = os.environ.get("HYDRA_JOB_NUM", "0")
+    
+    # Add key parameters that distinguish this run in the multirun
+    param_str = ""
+    if hasattr(config, 'train_marginal'):
+        param_str += f"_marg{config.train_marginal}"
+    if hasattr(config.data.random_variable, 'seq_length'):
+        param_str += f"_seq{config.data.random_variable.seq_length}"
+        
+    # Create the unique run name
+    wandb_config["name"] = f"{base_name}_job{job_id}_{unique_id}{param_str}"
+    
+    # Force creation of a new run
+    wandb_config["id"] = None
+    wandb_config["resume"] = "never"
+    
+    # Update the group name to include the job ID to prevent cross-job grouping
+    if "group" in wandb_config:
+        wandb_config["group"] = f"{wandb_config['group']}_job{job_id}"
+    
     wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
-
+        config=omegaconf.OmegaConf.to_object(config),
+        **wandb_config)
+    
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
       and utils.fsspec_exists(

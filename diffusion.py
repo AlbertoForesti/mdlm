@@ -340,7 +340,7 @@ class Diffusion(L.LightningModule):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma[:, None])
+      logits = self.backbone(x, self._reshape_based_on_noise(sigma))
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
@@ -436,7 +436,7 @@ class Diffusion(L.LightningModule):
       move_chance = move_chance[:, None]
     else:
       sigma, dsigma = self.noise(t)
-      move_chance = 1 - torch.exp(-sigma[:, None])
+      move_chance = 1 - torch.exp(-self._reshape_based_on_noise(sigma))
 
     xt = self.q_xt(x0, move_chance)
 
@@ -478,7 +478,10 @@ class Diffusion(L.LightningModule):
     return info_metrics
 
   def _entropy(self, x0, xt, sigma, dsigma):
-    log_score = self.get_score(xt, sigma[:,None], return_logscore=True)
+    log_score = self.get_score(xt, sigma, return_logscore=True)
+
+    sigma = sigma[:,None]
+    dsigma = dsigma[:,None]
 
     rel_ind = xt == self.mask_index
     esigm1 = torch.where(
@@ -491,10 +494,14 @@ class Diffusion(L.LightningModule):
     
     # log_score = torch.scatter(log_score, -1, xt, torch.zeros_like(log_score))
     # score = torch.scatter(log_score.exp(), -1, xt, torch.zeros_like(log_score))
-    score = log_score.exp()
+    log_score = torch.scatter(log_score, -1, xt, torch.zeros_like(log_score))
+    score = torch.scatter(log_score.exp(), -1, xt, torch.zeros_like(log_score))
 
-    esigm1 = esigm1.unsqueeze(-1).unsqueeze(-1)
-    ratio = 1 / esigm1.expand_as(score)
+    esigm1 = esigm1.unsqueeze(-1)
+    try:
+      ratio = 1 / esigm1.expand_as(score)
+    except:
+      raise UserWarning(f"incompatible shapes: {esigm1.shape}, {score.shape}, {xt.shape}, {sigma.shape}")
     ratio = ratio/(self.vocab_size-1)
 
     rel_ind = rel_ind.unsqueeze(-1).expand_as(score)
@@ -512,7 +519,7 @@ class Diffusion(L.LightningModule):
 
     transp_rate = self._transp_rate(xt)
     scale_factor = torch.scatter(transp_rate, -1, xt[...,None], torch.zeros_like(transp_rate))
-    scale_factor = scale_factor * dsigma[..., None, None]
+    scale_factor = scale_factor * dsigma[..., None]
     # scale_factor = dsigma[..., None]
 
     ret = scale_factor * unscaled_ret_value
@@ -522,7 +529,7 @@ class Diffusion(L.LightningModule):
     ret = ret.reshape(ret.shape[0], -1)
     ret = ret.sum(dim=-1)
 
-    if np.random.rand() < 1e-3 and False:
+    if np.random.rand() < 1e-2:
         print(f"score is {score[:5]}\
               \n log_score is {log_score[:5]}\
               \n rel_ind is {rel_ind[:5]}\
@@ -532,7 +539,7 @@ class Diffusion(L.LightningModule):
               \n xt is {xt[:5]}\
               ******************************************\n")
 
-    return xt.shape[1]*np.log(self.vocab_size)-ret.mean().item()
+    return xt.shape[1]*np.log(self.vocab_size-1)-ret.mean().item()
   
   def _score_divergence(self, log_score_p, log_score_q, dsigma, x):
 
@@ -686,7 +693,6 @@ class Diffusion(L.LightningModule):
                  on_step=False,
                  sync_dist=True)
       if self.config.eval.compute_entropy:
-        print("Entropy is", self.valid_info_metrics['entropy'].compute())
         self.log('val/entropy',
                  self.valid_info_metrics['entropy'].compute(),
                  on_epoch=True,
@@ -997,10 +1003,11 @@ class Diffusion(L.LightningModule):
       #     log score(x_i, t) = - log k
       #     where k = exp(- sigma) / (1 - exp(- sigma))
       
-      log_k = - torch.log(torch.expm1(sigma)).squeeze(-1)
-      assert log_k.ndim == 1, f"Expected 1, got {log_k.ndim}, sigma {sigma.shape}, log_k {log_k.shape}, x {x.shape}"
+      log_k = - torch.log(torch.expm1(sigma))
+      log_k = self._reshape_based_on_noise(log_k)
+      # assert log_k.ndim == 1, f"Expected 1, got {log_k.ndim}, sigma {sigma.shape}, log_k {log_k.shape}, x {x.shape}"
       
-      masked_score = model_output + log_k[:, None, None]
+      masked_score = model_output + log_k[:, None]
       masked_score[:, :, self.mask_index] = 0
 
       unmasked_score = self.neg_infinity * torch.ones_like(
@@ -1011,7 +1018,7 @@ class Diffusion(L.LightningModule):
         x[..., None],
         torch.zeros_like(unmasked_score[..., :1]))
       unmasked_score[:, :, self.mask_index] = - (
-        log_k[:, None] * torch.ones_like(x))
+        log_k * torch.ones_like(x))
       
       masked_indices = (x == self.mask_index).to(
         model_output.dtype)[:, :, None]
@@ -1035,7 +1042,7 @@ class Diffusion(L.LightningModule):
   def _staggered_score(self, score, dsigma):
     score = score.clone()
     extra_const = (1 - dsigma.exp()) * score.sum(dim=-1)
-    score *= dsigma.exp()[:, None]
+    score *= self._reshape_based_on_noise(dsigma.exp())
     score[..., self.mask_index] += extra_const
     return score
 
@@ -1084,7 +1091,7 @@ class Diffusion(L.LightningModule):
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]
     if seqlen > self.config.model.length:
-      assert seqlen == 2 * self.config.model.length
+      assert seqlen == 2 * self.config.model.length, f"Expected {2 * self.config.model.length}, got {seqlen}"
       # cropping is needed for text8-crop dataset
       # try the same starting point for now
       start = np.random.choice(self.config.model.length)
@@ -1134,17 +1141,25 @@ class Diffusion(L.LightningModule):
       move_chance = move_chance[:, None]
     else:
       sigma, dsigma = self.noise(t)
-      unet_conditioning = sigma[:, None]
-      move_chance = 1 - torch.exp(-sigma[:, None])
+      unet_conditioning = self._reshape_based_on_noise(sigma)
+      move_chance = 1 - torch.exp(-self._reshape_based_on_noise(sigma))
 
     xt = self.q_xt(x0, move_chance)
+    if self.config.train_marginal:
+      selected_mask = np.random.choice(len(self.config.mutinfo.var_indices)+1)
+      if selected_mask < len(self.config.mutinfo.var_indices):
+        x_mask = self._get_mask_from_list_of_indices(x0, self.config.mutinfo.var_indices[selected_mask])
+        xt = torch.where(x_mask, xt, x0)
+    else:
+      selected_mask = None
+      
     model_output = self.forward(xt, unet_conditioning)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
       score_entropy = self._score_entropy(
-        model_output, sigma[:, None], xt, x0)
-      return dsigma[:, None] * score_entropy
+        model_output, self._reshape_based_on_noise(sigma), xt, x0)
+      return self._reshape_based_on_noise(dsigma) * score_entropy
     
     if self.T > 0:
       diffusion_loss = self._d3pm_loss(
@@ -1165,8 +1180,17 @@ class Diffusion(L.LightningModule):
       return log_p_theta * torch.log1p(
         - torch.exp(- self.noise.sigma_min))
     
+    if self.config.train_marginal and selected_mask < len(self.config.mutinfo.var_indices):
+      loss_mask = self._get_mask_from_list_of_indices(log_p_theta, self.config.mutinfo.var_indices[selected_mask])
+      log_p_theta = torch.where(loss_mask, log_p_theta, torch.zeros_like(log_p_theta))
+    
     return - log_p_theta * (
-      dsigma / torch.expm1(sigma))[:, None]
+      self._reshape_based_on_noise(dsigma / torch.expm1(sigma)))
+  
+  def _reshape_based_on_noise(self, x):
+    if self.config.noise.type == 'learnable':
+      return x
+    return x[:, None]
 
   def _loss(self, x0, attention_mask):
     (input_tokens, output_tokens,

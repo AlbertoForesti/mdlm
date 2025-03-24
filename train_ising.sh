@@ -2,10 +2,9 @@
 export HF_HOME="/home/foresti/.cache/huggingface"
 export HF_DATASET_CACHE="/home/foresti/.cache/huggingface/datasets"
 export HYDRA_FULL_ERROR=1
-python main.py -m \
+python main.py --config-name=config_entropy\
   mode=train \
-  train_marginal=True,False \
-  data.random_variable.seq_length=1,4,16,64 \
+  model.length=400 \
   backbone=unetmlp \
   strategy=single_device \
-  wandb.group=categorical_long_vector
+  strategy.device=2

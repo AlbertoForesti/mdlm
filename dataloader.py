@@ -605,8 +605,12 @@ def get_dataset(
 
 def get_tokenizer(config):
   if "synthetic" in config.data.train:
-    tokenizer = IdentityTokenizer(
+    try:
+      tokenizer = IdentityTokenizer(
       vocab_size=config.data.random_variable.dim)
+    except:
+      tokenizer = IdentityTokenizer(
+      vocab_size=2)
     return tokenizer
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
@@ -823,20 +827,16 @@ def get_synthetic_dataloaders(config, tokenizer):
   random_variable = hydra.utils.instantiate(
     config.data.random_variable)
   
-  x_train, y_train = random_variable.rvs(
+  outputs = random_variable.rvs(
     config.data.train_size)
-
-  xy_train = (
-    torch.tensor(x_train, dtype=torch.long),
-    torch.tensor(y_train, dtype=torch.long
-    ))
-
-  x_valid, y_valid = random_variable.rvs(
-    config.data.valid_size)
   
-  xy_valid = (
-    torch.tensor(x_valid, dtype=torch.long),
-    torch.tensor(y_valid, dtype=torch.long))
+  if isinstance(outputs, tuple):
+    xy_train = (
+      torch.tensor(outputs[0], dtype=torch.long),
+      torch.tensor(outputs[1], dtype=torch.long
+      ))
+  else:
+    xy_train = (torch.tensor(outputs, dtype=torch.long),)
   
   train_loader = torch.utils.data.DataLoader(
     SyntheticDataset(xy_train),
@@ -847,7 +847,7 @@ def get_synthetic_dataloaders(config, tokenizer):
   train_loader.tokenizer = tokenizer
 
   valid_loader = torch.utils.data.DataLoader(
-    SyntheticDataset(xy_valid),
+    SyntheticDataset(xy_train),
     batch_size=config.loader.eval_batch_size,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,

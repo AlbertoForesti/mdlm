@@ -78,6 +78,8 @@ class Diffusion(L.LightningModule):
 
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
+    if 'llada' in self.config.backbone.lower():
+      self.vocab_size = 126464
     self.sampler = self.config.sampling.predictor
     self.gen_ppl_eval_model_name_or_path = self.config.eval.\
       gen_ppl_eval_model_name_or_path
@@ -86,8 +88,11 @@ class Diffusion(L.LightningModule):
     self.change_of_variables = self.config.training.change_of_variables
     if (not hasattr(self.tokenizer, 'mask_token')
         or self.tokenizer.mask_token is None):
-      self.mask_index = self.vocab_size
-      self.vocab_size += 1
+      if 'llada' in self.config.backbone.lower():
+        self.mask_index = 126336
+      else:
+        self.mask_index = self.vocab_size
+        self.vocab_size += 1
     else:
       self.mask_index = self.tokenizer.mask_token_id
     self.parameterization = self.config.parameterization
@@ -113,6 +118,8 @@ class Diffusion(L.LightningModule):
         config.eval.checkpoint_path, trust_remote_code=True)
       except:
         raise ValueError(f"Could not load model from {config.eval.checkpoint_path}")
+    elif self.config.backbone == 'llada':
+      self.backbone = transformers.AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True, torch_dtype=torch.bfloat16)
     else:
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
@@ -340,7 +347,10 @@ class Diffusion(L.LightningModule):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, self._reshape_based_on_noise(sigma))
+      if self.config.backbone == 'llada':
+        logits = self.backbone(x).logits
+      else:
+        logits = self.backbone(x, self._reshape_based_on_noise(sigma, is_unet_conditioning=True))
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
@@ -443,10 +453,6 @@ class Diffusion(L.LightningModule):
     info_metrics = dict()
 
     config = self._get_stage_config_from_prefix(prefix)
-    """se = self._score_entropy(self.get_score(xt, sigma[:, None], return_logscore=True), sigma[:, None], xt, x0)
-    se = dsigma[:,None]*se
-    se = se.sum(dim=-1)
-    se = se.mean().item()"""
     
     if config.compute_entropy:
       info_metrics['entropy'] = self._entropy(x0, xt, sigma, dsigma)
@@ -477,7 +483,11 @@ class Diffusion(L.LightningModule):
         raise NotImplementedError(f'Invalid prefix: {prefix}')
     return info_metrics
 
+  @torch.no_grad()
   def _entropy(self, x0, xt, sigma, dsigma):
+    torch.cuda.empty_cache()
+    memory_allocated_before = torch.cuda.memory_allocated()
+    memory_reserved_before = torch.cuda.memory_reserved()
     log_score = self.get_score(xt, sigma, return_logscore=True)
 
     sigma = sigma[:,None]
@@ -515,33 +525,66 @@ class Diffusion(L.LightningModule):
     # unscaled_ret_value = pos_term - neg_term + const
     unscaled_ret_value = pos_term - neg_term + const
 
+    del pos_term, neg_term, const
+
+    """raise UserWarning(f"unscaled_ret_value: {unscaled_ret_value.shape}, dsigma: {dsigma.shape}\n\
+                      xt: {xt.shape}, sigma: {sigma.shape}, log_score: {log_score.shape},\n\
+                      rel_ind: {rel_ind.shape}, ratio: {ratio.shape}, vocab_size: {self.vocab_size}\n\
+                      Examples: {unscaled_ret_value[:5]}, {dsigma[:5]}, {xt[:5]}, {sigma[:5]}")
+    """
     xt = xt.squeeze(-1)
 
     transp_rate = self._transp_rate(xt)
     scale_factor = torch.scatter(transp_rate, -1, xt[...,None], torch.zeros_like(transp_rate))
     scale_factor = scale_factor * dsigma[..., None]
     # scale_factor = dsigma[..., None]
-
-    ret = scale_factor * unscaled_ret_value
+    try:
+      ret = scale_factor * unscaled_ret_value
+    except:
+      raise ValueError(f"incompatible shapes: scale_factor={scale_factor.shape}\
+                       , unscaled_ret_value={unscaled_ret_value.shape},\
+                        xt={xt.shape}, sigma={sigma.shape}, dsigma={dsigma.shape}\
+                        score={score.shape}, log_score={log_score.shape},\
+                        rel_ind={rel_ind.shape}, ratio={ratio.shape}")
     ret = torch.where(rel_ind, ret, torch.zeros_like(ret))
     ret = ret[:,:,:-1]
 
     ret = ret.reshape(ret.shape[0], -1)
     ret = ret.sum(dim=-1)
 
-    if np.random.rand() < 1e-2:
-        print(f"score is {score[:5]}\
-              \n log_score is {log_score[:5]}\
-              \n rel_ind is {rel_ind[:5]}\
-              \n ret is {ret[:5]}\
-              \n ret.mean is {ret.mean()}\
-              \n x0 is {x0[:5]}\
-              \n xt is {xt[:5]}\
-              ******************************************\n")
-
     return xt.shape[1]*np.log(self.vocab_size-1)-ret.mean().item()
   
+  def _debug_memory_usage(self, tensors_dict):
+    """Analyze tensor sizes and gradient status"""
+    print("\n==== MEMORY USAGE ANALYSIS ====")
+    total_bytes = 0
+    for name, tensor in tensors_dict.items():
+        if tensor is None:
+            print(f"{name}: None")
+            continue
+            
+        size_bytes = tensor.element_size() * tensor.numel()
+        total_mb = size_bytes / (1024 * 1024)
+        total_bytes += size_bytes
+        
+        print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}, "
+              f"size={total_mb:.2f}MB, requires_grad={tensor.requires_grad}")
+    
+    print(f"Total memory of tracked tensors: {total_bytes / (1024 * 1024):.2f}MB")
+    
+    # Get overall CUDA memory stats
+    if torch.cuda.is_available():
+        print("\nCUDA Memory Stats:")
+        print(f"Allocated: {torch.cuda.memory_allocated() / (1024 * 1024):.2f}MB")
+        print(f"Reserved: {torch.cuda.memory_reserved() / (1024 * 1024):.2f}MB")
+        print(f"Max Allocated: {torch.cuda.max_memory_allocated() / (1024 * 1024):.2f}MB")
+    print("===========================\n")
+  
+  @torch.no_grad()
   def _score_divergence(self, log_score_p, log_score_q, dsigma, x):
+
+    memory_allocated_before = torch.cuda.memory_allocated()
+    memory_reserved_before = torch.cuda.memory_reserved()
 
     x = x.unsqueeze(-1)
 
@@ -559,13 +602,16 @@ class Diffusion(L.LightningModule):
 
     unscaled_ret_value = pos_term - neg_term + const
 
-    transp_rate = self._transp_rate(x)
-    scale_factor = torch.scatter(transp_rate, -1, x[...,None], torch.zeros_like(transp_rate))
+    del pos_term, neg_term, const, score_p, score_q, log_score_p, log_score_q
+    torch.cuda.empty_cache()
 
     x = x.squeeze(-1)
-
     transp_rate = self._transp_rate(x)
     scale_factor = torch.scatter(transp_rate, -1, x[...,None], torch.zeros_like(transp_rate))
+
+    memory_allocated_after = torch.cuda.memory_allocated()
+    memory_reserved_after = torch.cuda.memory_reserved()
+
     try:
       scale_factor = scale_factor * dsigma[..., None]
     except:
@@ -573,7 +619,6 @@ class Diffusion(L.LightningModule):
 
     ret = scale_factor * unscaled_ret_value
     ret = ret.reshape(ret.shape[0], -1)
-
     ret = ret.sum(dim=-1)
 
     return ret
@@ -589,7 +634,11 @@ class Diffusion(L.LightningModule):
   def _get_conditioning_signals(self):
     return tuple(range(len(self.config.mutinfo.var_indices)+1)) # for all the variables +1 for the joint
 
+  @torch.no_grad()
   def _mutinfo(self, x0, xt, sigma, dsigma):
+    torch.cuda.empty_cache()
+    memory_allocated_before = torch.cuda.memory_allocated()
+    memory_reserved_before = torch.cuda.memory_reserved()
     x_mask, y_mask = self._get_masks(x0)
     joint_signal, x_signal, y_signal = self._get_conditioning_signals()
     masked_batch = self.mask_index * torch.ones_like(x0)
@@ -600,33 +649,9 @@ class Diffusion(L.LightningModule):
     log_score_joint = self.get_score_with_signal(xt, sigma, joint_signal, return_logscore=True)
     x_mask_score_shape_broadcast = x_mask.unsqueeze(-1).expand_as(log_score_marginal_x)
     log_score_marginal = torch.where(x_mask_score_shape_broadcast, log_score_marginal_x, log_score_marginal_y)
+    del x0, x_mask, y_mask, xt_marginal_x, xt_marginal_y, log_score_marginal_x, log_score_marginal_y
+    torch.cuda.empty_cache()
     mutinfo = self._score_divergence(log_score_joint, log_score_marginal, dsigma[:,None], xt)
-    """print(f"DEBUG:\n\
-                      x_mask: {x_mask[:5]}\n\
-                      y_mask: {y_mask[:5]}\n\
-                      xt_marginal_x: {xt_marginal_x[:5]}\n\
-                      xt_marginal_y: {xt_marginal_y[:5]}\n\
-                      x_mask_score_shape_broadcast: {x_mask_score_shape_broadcast[:5]}\n\
-                      log_score_marginal_x: {log_score_marginal_x[:5]}\n\
-                      log_score_marginal_y: {log_score_marginal_y[:5]}\n\
-                      score_marginal: {log_score_marginal[:5]}\n\
-                      log_score_joint: {log_score_joint[:5]}\n\
-                      mutinfo: {mutinfo}\n\
-                      xt shape: {xt.shape}\n\
-                      sigma shape: {sigma.shape}\n\
-                      dsigma shape: {dsigma.shape}\n\
-                      x0 shape: {x0.shape}\n\
-                      x_mask shape: {x_mask.shape}\n\
-                      y_mask shape: {y_mask.shape}\n\
-                      x_mask_score_shape_broadcast shape: {x_mask_score_shape_broadcast.shape}\n\
-                      xt_marginal_x shape: {xt_marginal_x.shape}\n\
-                      xt_marginal_y shape: {xt_marginal_y.shape}\n\
-                      log_score_marginal_x shape: {log_score_marginal_x.shape}\n\
-                      log_score_marginal_y shape: {log_score_marginal_y.shape}\n\
-                      score_marginal shape: {log_score_marginal.shape}\n\
-                      log_score_joint shape: {log_score_joint.shape}\n\
-                      mutinfo shape: {mutinfo.shape}\n\
-                      ******************************************\n")"""
     return mutinfo.mean().item()
 
   def on_train_epoch_start(self):
@@ -642,7 +667,9 @@ class Diffusion(L.LightningModule):
              sync_dist=True)
     return loss
 
+  @torch.no_grad()
   def on_validation_epoch_start(self):
+    torch.cuda.empty_cache()
     if self.ema:
       self.ema.store(itertools.chain(
         self.backbone.parameters(),
@@ -655,14 +682,17 @@ class Diffusion(L.LightningModule):
     assert self.valid_metrics.nll.mean_value == 0
     assert self.valid_metrics.nll.weight == 0
 
+  @torch.no_grad()
   def validation_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='val')
+    torch.cuda.empty_cache() # Frees reserved memory
     info_metrics = self._compute_information_metrics(batch['input_ids'], prefix='val')
     return {
       'loss': loss,
       **info_metrics
     }
 
+  @torch.no_grad()
   def on_validation_epoch_end(self):
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
@@ -686,28 +716,30 @@ class Diffusion(L.LightningModule):
           key=f'samples@global_step{self.global_step}',
           columns=['Generated Samples'],
           data=[[s] for s in text_samples])
-      if self.config.eval.compute_generative_perplexity:
-        self.log('val/gen_ppl',
-                 self.gen_ppl_metric,
-                 on_epoch=True,
-                 on_step=False,
-                 sync_dist=True)
-      if self.config.eval.compute_entropy:
-        self.log('val/entropy',
-                 self.valid_info_metrics['entropy'].compute(),
-                 on_epoch=True,
-                 on_step=False,
-                 sync_dist=True)
-      if self.config.eval.compute_mutinfo:
-        self.log('val/mutinfo',
-                 self.valid_info_metrics['mutinfo'].compute(),
-                 on_epoch=True,
-                 on_step=False,
-                 sync_dist=True)
+    if self.config.eval.compute_generative_perplexity:
+      self.log('val/gen_ppl',
+                self.gen_ppl_metric,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True)
+    if self.config.eval.compute_entropy:
+      self.log('val/entropy',
+                self.valid_info_metrics['entropy'].compute(),
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True)
+    if self.config.eval.compute_mutinfo:
+      self.log('val/mutinfo',
+                self.valid_info_metrics['mutinfo'].compute(),
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True)
     if self.ema:
       self.ema.restore(
         itertools.chain(self.backbone.parameters(),
                         self.noise.parameters()))
+    # Memory consumption check
+    
 
   def configure_optimizers(self):
     # TODO(yair): Lightning currently giving this warning when using `fp16`:
@@ -1141,15 +1173,18 @@ class Diffusion(L.LightningModule):
       move_chance = move_chance[:, None]
     else:
       sigma, dsigma = self.noise(t)
-      unet_conditioning = self._reshape_based_on_noise(sigma)
+      unet_conditioning = self._reshape_based_on_noise(sigma, is_unet_conditioning=True)
       move_chance = 1 - torch.exp(-self._reshape_based_on_noise(sigma))
-
-    xt = self.q_xt(x0, move_chance)
+    try:
+      xt = self.q_xt(x0, move_chance)
+    except:
+      raise UserWarning(f"move_chance shape: {move_chance.shape}, x0 shape: {x0.shape}")
     if self.config.train_marginal:
       selected_mask = np.random.choice(len(self.config.mutinfo.var_indices)+1)
       if selected_mask < len(self.config.mutinfo.var_indices):
         x_mask = self._get_mask_from_list_of_indices(x0, self.config.mutinfo.var_indices[selected_mask])
-        xt = torch.where(x_mask, xt, x0)
+        masked_batch = self.mask_index * torch.ones_like(x0)
+        xt = torch.where(x_mask, xt, masked_batch)
     else:
       selected_mask = None
       
@@ -1159,6 +1194,9 @@ class Diffusion(L.LightningModule):
     if self.parameterization == 'sedd':
       score_entropy = self._score_entropy(
         model_output, self._reshape_based_on_noise(sigma), xt, x0)
+      if self.config.train_marginal and selected_mask < len(self.config.mutinfo.var_indices):
+        loss_mask = self._get_mask_from_list_of_indices(score_entropy, self.config.mutinfo.var_indices[selected_mask])
+        score_entropy = torch.where(loss_mask, score_entropy, torch.zeros_like(score_entropy))
       return self._reshape_based_on_noise(dsigma) * score_entropy
     
     if self.T > 0:
@@ -1187,8 +1225,10 @@ class Diffusion(L.LightningModule):
     return - log_p_theta * (
       self._reshape_based_on_noise(dsigma / torch.expm1(sigma)))
   
-  def _reshape_based_on_noise(self, x):
+  def _reshape_based_on_noise(self, x, is_unet_conditioning=False):
     if self.config.noise.type == 'learnable':
+      return x
+    if self.config.backbone == 'hf_dit' and is_unet_conditioning:
       return x
     return x[:, None]
 

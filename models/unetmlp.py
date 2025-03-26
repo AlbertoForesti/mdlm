@@ -4,7 +4,6 @@ from positional_encodings.torch_encodings import PositionalEncoding1D, Summer
 from pytorch_lightning import LightningModule
 import torch
 import math
-import numpy as np
 
 from torch import nn
 

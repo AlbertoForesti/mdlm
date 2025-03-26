@@ -97,7 +97,7 @@ class Linear(Noise):
     self.sigma_max = torch.tensor(sigma_max, dtype=dtype)
 
   def rate_noise(self, t):
-    return self.sigma_max - self.sigma_min
+    return (self.sigma_max - self.sigma_min) * torch.ones_like(t)
 
   def total_noise(self, t):
     return self.sigma_min + t * (self.sigma_max - self.sigma_min)

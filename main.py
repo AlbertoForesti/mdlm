@@ -7,6 +7,7 @@ import omegaconf
 import rich.syntax
 import rich.tree
 import torch
+import re
 
 import dataloader
 import diffusion
@@ -25,6 +26,19 @@ omegaconf.OmegaConf.register_new_resolver(
 omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 omegaconf.OmegaConf.register_new_resolver("model_length", lambda seq_length: 2 * int(seq_length))
+
+def get_data_key(dataconfig):
+  if hasattr(dataconfig, "random_variable"):
+    return f"{dataconfig.train}_seqlen={dataconfig.random_variable.seq_length}_dim={dataconfig.random_variable.dim}_mutinfo={dataconfig.random_variable.mutual_information}"
+  if "summ" in dataconfig.train:
+    model_id = extract_model_id(dataconfig.train)
+    return f"summeval_summarizer={model_id}_{os.path.basename(dataconfig.train)}"
+  raise NotImplementedError(f"Resolver not implemented for train={dataconfig.train} and valid={dataconfig.valid}")
+
+def get_model_key(modelconfig):
+  return modelconfig.name
+
+omegaconf.OmegaConf.register_new_resolver("get_data_key", get_data_key)
 
 
 def _load_from_checkpoint(config, tokenizer):
@@ -177,39 +191,53 @@ def _ppl_eval(config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
 
+def extract_model_id(path):
+    """Extract model ID (like M7) from a path"""
+    # Use regex to find MX pattern in the path
+    match = re.search(r'/M(\d+)/', path)
+    if match:
+        return f"M{match.group(1)}"
+    return None
+
+def _get_unique_wandb_config(config):
+  wandb_config = dict(config.wandb)
+    
+  # Generate a unique name that includes run parameters (for multirun)
+  base_name = wandb_config.pop("name", f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+  
+  # Add a unique identifier - combine timestamp with random string
+  import uuid
+  unique_id = str(uuid.uuid4())[:8]
+  job_id = os.environ.get("HYDRA_JOB_NUM", "0")
+  
+  # Add key parameters that distinguish this run in the multirun
+  param_str = ""
+  assert not hasattr(config.wandb, 'tags'), "wandb tags are set automatically, do not set them in the config"
+  if hasattr(config, 'train_marginal'):
+    param_str += f"_marg{config.train_marginal}"
+  param_str = f"{get_data_key(config.data)}_{get_model_key(config.model)}"
+  tags = [get_data_key(config.data), get_model_key(config.model)]
+  omegaconf.OmegaConf.update(config, "wandb.tags", tags, force_add=True)
+  # Create the unique run name
+  wandb_config["name"] = f"{base_name}_job{job_id}_{unique_id}{param_str}"
+  
+  # Force creation of a new run
+  wandb_config["id"] = None
+  wandb_config["resume"] = "never"
+  
+  # Update the group name to include the job ID to prevent cross-job grouping
+  if "group" in wandb_config:
+    wandb_config["group"] = f"{wandb_config['group']}_job{job_id}"
+  return wandb_config
+
 
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
   if config.get('wandb', None) is not None:
     # Create a unique name for the W&B run in multirun mode
-    wandb_config = dict(config.wandb)
-    
-    # Generate a unique name that includes run parameters (for multirun)
-    base_name = wandb_config.pop("name", f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    
-    # Add a unique identifier - combine timestamp with random string
-    import uuid
-    unique_id = str(uuid.uuid4())[:8]
-    job_id = os.environ.get("HYDRA_JOB_NUM", "0")
-    
-    # Add key parameters that distinguish this run in the multirun
-    param_str = ""
-    if hasattr(config, 'train_marginal'):
-        param_str += f"_marg{config.train_marginal}"
-    if hasattr(config.data.random_variable, 'seq_length'):
-        param_str += f"_seq{config.data.random_variable.seq_length}"
-        
-    # Create the unique run name
-    wandb_config["name"] = f"{base_name}_job{job_id}_{unique_id}{param_str}"
-    
-    # Force creation of a new run
-    wandb_config["id"] = None
-    wandb_config["resume"] = "never"
-    
-    # Update the group name to include the job ID to prevent cross-job grouping
-    if "group" in wandb_config:
-        wandb_config["group"] = f"{wandb_config['group']}_job{job_id}"
+
+    wandb_config = _get_unique_wandb_config(config)
     
     wandb_logger = L.pytorch.loggers.WandbLogger(
         config=omegaconf.OmegaConf.to_object(config),
@@ -246,7 +274,6 @@ def _train(config, logger, tokenizer):
   model = diffusion.Diffusion(
     config, tokenizer=valid_ds.tokenizer)
   
-
   trainer = hydra.utils.instantiate(
     config.trainer,
     default_root_dir=os.getcwd(),

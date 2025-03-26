@@ -1,15 +1,15 @@
 defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
-  - /data: summeval
-  - /model: medium
+  - /data: synthetic
+  - /model: unetmlp070k
   - /strategy: ddp
-  - /noise: loglinear
-  - /lr_scheduler: constant_warmup
+  - /noise: geometric
+  - /lr_scheduler: cosine_hard_restart_warmup
 
 mode: train  # train / ppl_eval / sample_eval / info_eval
 diffusion: absorbing_state
-backbone: hf_dit  # dit / dimamba / ar / unetmlp / hf_dit / llada
+backbone: unetmlp  # dit / dimamba / ar / unetmlp / hf_dit / llada
 parameterization: subs  # subs / d3pm / sedd
 time_conditioning: True
 T: 0  # 0 (continuous time) / 1000 
@@ -19,11 +19,11 @@ train_marginal: True
 seed: 42
 
 loader:
-  global_batch_size: 128
+  global_batch_size: 1024
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
-  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  eval_batch_size: 16 # ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  batch_size: 1024
+  eval_batch_size: 1024 # ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   num_workers: 1
   pin_memory: True
 
@@ -39,7 +39,7 @@ sampling:
   num_strides: 1
 
 training:
-  ema: 0.9999
+  ema: 0.999
   antithetic_sampling: True
   importance_sampling: False
   sampling_eps: 1e-3
@@ -54,14 +54,14 @@ eval:
   perplexity_batch_size: 8
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
-  generate_samples: True
+  generate_samples: False
   mc_estimates: 100
   compute_entropy: True
   compute_mutinfo: True
 
 optim:
   weight_decay: 0
-  lr: 3e-4
+  lr: 1e-2
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -75,11 +75,12 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16' # bf16
   num_sanity_val_steps: 2
-  max_steps: 20_000
+  max_steps: 100_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  check_val_every_n_epoch: 1
+  val_check_interval: 10000
+  check_val_every_n_epoch: null
 
 wandb:
   project: text-diffusion
@@ -94,7 +95,7 @@ hydra:
     dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
   sweep:  # Add this section
     dir: ./multirun/${now:%Y.%m.%d}/${now:%H%M%S}
-    subdir: run_${hydra.job.num}
+    subdir: run_${hydra.job.num}_${get_data_key:${data}}
   job:
     chdir: true
   

@@ -21,6 +21,7 @@ import utils
 import hydra
 
 from itertools import cycle
+from datasets import load_dataset
 
 LOGGER = utils.get_logger(__name__)
 
@@ -330,9 +331,9 @@ def _group_texts(examples, block_size, bos, eos):
   result['attention_mask'] = _attn_masks
   return result
 
-def get_summarization_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
+def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
     field_size_dict, block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
-  assert sum(list(field_size_dict.values())) == block_size - len(field_size_dict), f"Total field size must be {block_size - len(field_size_dict) - 1}, instead got {list(field_size_dict.values())} with sum {sum(list(field_size_dict.values()))}"
+  assert sum(list(field_size_dict.values())) == block_size - len(field_size_dict) - 1, f"Total field size must be {block_size - len(field_size_dict) - 1}, instead got {list(field_size_dict.values())} with sum {sum(list(field_size_dict.values()))}"
   field_length_str = '_'.join(
       [f'{k}{v}' for k, v in field_size_dict.items()])
   if wrap:
@@ -345,17 +346,10 @@ def get_summarization_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
     return torch.load(_path)
   LOGGER.info(f'Generating new data at: {_path}')
 
-  if 'multi_news' in dataset_name:
-    dataset = datasets.load_dataset(
-      dataset_name,
-      cache_dir=cache_dir,
-      streaming=streaming,
-      trust_remote_code=True)
   EOS = tokenizer.encode(tokenizer.eos_token)[0]
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
   def preprocess_and_tokenize(example, field, max_field_length):
-    if 'multi_news' in dataset_name:
-      text = example[field]
+    text = example[field]
       
     tokenizer.padding_side = 'right'
     tokenizer.truncation_side = 'right'
@@ -377,13 +371,11 @@ def get_summarization_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
                          add_special_tokens=True,
                          return_attention_mask=True,
                          return_token_type_ids=True,)
-        tokens = {'input_ids':
-                [t + [EOS] for t in tokens['input_ids']]}
         # print(len(tokens['input_ids']))
       except:
         raise ValueError(f'Error tokenizing: {text}')
     return tokens
-  data = dataset[mode]
+  data = load_dataset('json', data_files=dataset_name)['train']
   tokenized_datasets_by_field = {}
   for field, max_field_length in field_size_dict.items():
     preprocess_and_tokenize_field = functools.partial(
@@ -412,9 +404,9 @@ def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
     block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None):
   
-  if 'multi_news' in dataset_name:
+  if 'aligned' in dataset_name:
     assert field_size_dict is not None, f"field_size_dict must be provided for {dataset_name} dataset"
-    return get_summarization_dataset(
+    return get_summeval_dataset(
       dataset_name, tokenizer, wrap, mode, cache_dir,
       field_size_dict=field_size_dict, block_size=block_size, num_proc=num_proc, streaming=streaming)
 
@@ -612,6 +604,7 @@ def get_tokenizer(config):
       tokenizer = IdentityTokenizer(
       vocab_size=2)
     return tokenizer
+  
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
@@ -649,22 +642,6 @@ def get_tokenizer(config):
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
-  num_gpus = torch.cuda.device_count()
-  assert (config.loader.global_batch_size
-          == (config.loader.batch_size
-              * config.trainer.num_nodes
-              * num_gpus
-              * config.trainer.accumulate_grad_batches))
-  if config.loader.global_batch_size % (
-    num_gpus * config.trainer.accumulate_grad_batches) != 0:
-    raise ValueError(
-      f'Train Batch Size {config.training.batch_size}'
-      f'not divisible by {num_gpus} gpus with accumulation '
-      f'{config.trainer.accumulate_grad_batches}.')
-  if config.loader.eval_global_batch_size % num_gpus != 0:
-    raise ValueError(
-      f'Eval Batch Size for {config.eval.batch_size} '
-      f'not divisible by {num_gpus}.')
   if "synthetic" in config.data.train:
     return get_synthetic_dataloaders(config, tokenizer)
   if skip_train:

@@ -33,6 +33,8 @@ def get_data_key(dataconfig):
   if "summ" in dataconfig.train:
     model_id = extract_model_id(dataconfig.train)
     return f"summeval_summarizer={model_id}_{os.path.basename(dataconfig.train)}"
+  if "Genomic" in dataconfig.train:
+    return dataconfig.train.split('/')[-1]
   raise NotImplementedError(f"Resolver not implemented for train={dataconfig.train} and valid={dataconfig.valid}")
 
 def get_model_key(modelconfig):
@@ -93,7 +95,10 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     ('train', train_ds), ('valid', valid_ds)]:
     print(f'Printing {dl_type} dataloader batch.')
     batch = next(iter(dl))
-    print('Batch input_ids.shape', batch['input_ids'].shape)
+    try:
+      print('Batch input_ids.shape', batch['input_ids'].shape)
+    except:
+      raise KeyError(f'input_ids not found in batch. Keys: {batch.keys()}')
     first = batch['input_ids'][0, :k]
     last = batch['input_ids'][0, -k:]
     print(f'First {k} tokens:', tokenizer.decode(first))
@@ -219,17 +224,12 @@ def _get_unique_wandb_config(config):
   tags = [get_data_key(config.data), get_model_key(config.model)]
   omegaconf.OmegaConf.update(config, "wandb.tags", tags, force_add=True)
   # Create the unique run name
-  wandb_config["name"] = f"{base_name}_job{job_id}_{unique_id}{param_str}"
+  wandb_config["name"] = f"{base_name}_job{job_id}_{unique_id}{param_str}_{config.parameterization}"
   
   # Force creation of a new run
   wandb_config["id"] = None
   wandb_config["resume"] = "never"
-  
-  # Update the group name to include the job ID to prevent cross-job grouping
-  if "group" in wandb_config:
-    wandb_config["group"] = f"{wandb_config['group']}_job{job_id}"
   return wandb_config
-
 
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
@@ -258,7 +258,7 @@ def _train(config, logger, tokenizer):
       callbacks.append(hydra.utils.instantiate(callback))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer)
+    config, tokenizer, valid_seed=config.seed)
   _print_batch(train_ds, valid_ds, tokenizer)
   if config.eval.compute_mutinfo or config.training.compute_mutinfo:
     omegaconf.OmegaConf.update(config, "trainer.limit_val_batches", config.eval.mc_estimates, force_add=True)
@@ -270,7 +270,18 @@ def _train(config, logger, tokenizer):
           omegaconf.OmegaConf.update(config, "mutinfo.var_indices", train_ds.dataset.var_indices, force_add=True)
     else:
       raise ValueError("Dataset does not have var_indices.")
+  
+  # Setup DORA fine-tuning if enabled
+  if hasattr(config, "dora") and config.dora.enabled:
+    logger.info('DORA parameter-efficient fine-tuning enabled')
+    # Make sure we're using a pre-trained model
+    if not hasattr(config.model, "pretrained") or not config.model.pretrained:
+        logger.warning('DORA is meant for fine-tuning pretrained models. Setting pretrained=True')
+        omegaconf.OmegaConf.update(config, "model.pretrained", True, force_add=True)
     
+    # Add PEFT configuration to the model config
+    omegaconf.OmegaConf.update(config, "model.peft_config", config.dora, force_add=True)
+  
   model = diffusion.Diffusion(
     config, tokenizer=valid_ds.tokenizer)
   

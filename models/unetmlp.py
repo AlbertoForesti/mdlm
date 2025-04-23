@@ -184,6 +184,7 @@ class UnetMLP(LightningModule):
         # determine dimensions
         self.vocab_size = vocab_size
         self.absorb = "absorb"
+        self.config = config
         self.resnet_block_groups = config.model.resnet_block_groups
         self.sigma_dim = config.model.sigma_dim
         self.dim_mults = config.model.dim_mults
@@ -252,7 +253,7 @@ class UnetMLP(LightningModule):
 
         self.final_res_block = block_klass(
             init_dim * 2, init_dim, sigma_emb_dim=self.sigma_dim)
-
+    
         self.proj = nn.Linear(init_dim, self.vocab_size)
         self.p_enc_1d_model_sum = Summer(PositionalEncoding1D(init_dim))
 
@@ -294,7 +295,7 @@ class UnetMLP(LightningModule):
             x = block1(x, sigma)
 
             h.append(x)
-       #     x = downsample(x)
+        #   x = downsample(x)
 
         # x = self.mid_block1(x, sigma)
 
@@ -314,6 +315,9 @@ class UnetMLP(LightningModule):
         x = torch.cat((x, r), dim=-1)
 
         x = self.final_res_block(x, sigma)
+
+        if self.config.parameterization == "mine":
+            return x
 
         if std != None:
             x = self.final_lin(x) / std

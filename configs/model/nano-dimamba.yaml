@@ -1,10 +1,10 @@
-name: tiny
+name: nano
 type: dimamba
-hidden_size: 512
-cond_dim: 128
+hidden_size: 256
+cond_dim: 32
 length: 1024
-n_blocks: 14
-n_heads: 8
+n_blocks: 4
+n_heads: 2
 scale_by_sigma: True
 dropout: 0.1
 temb_strategy: null 

@@ -5,6 +5,7 @@ resnet_block_groups: 8
 length: ${model_length:${data.random_variable.seq_length}}
 sigma_dim: 4
 init_dim: 16
+hidden_size: ${model.init_dim}
 scaling_factor: null
 is_parametric_marginal: false
 use_marginal_flag: false

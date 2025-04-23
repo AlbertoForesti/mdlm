@@ -1,0 +1,2 @@
+_target_: torchkld.loss.DonskerVaradhanLoss
+ema_multiplier: 1e-2

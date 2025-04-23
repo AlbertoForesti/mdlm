@@ -8,7 +8,7 @@ dependencies:
   - cuda-nvcc=12.4.99
   - jupyter=1.0.0
   - pip=23.3.1
-  - python=3.9
+  - python=3.10
   - pytorch-cuda=12.1
   - pytorch=2.1.0  # Add PyTorch here
   - torchvision  # Optional, but often needed with PyTorch
@@ -37,3 +37,5 @@ dependencies:
       - triton==2.2.0
       - wandb==0.13.5
       - flash-attn==2.5.6
+      - peft==0.10.0
+      - numpy==1.26.0

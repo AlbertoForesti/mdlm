@@ -332,8 +332,8 @@ def _group_texts(examples, block_size, bos, eos):
   return result
 
 def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
-    field_size_dict, block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
-  assert sum(list(field_size_dict.values())) == block_size - len(field_size_dict) - 1, f"Total field size must be {block_size - len(field_size_dict) - 1}, instead got {list(field_size_dict.values())} with sum {sum(list(field_size_dict.values()))}"
+    field_size_dict, block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, p_random=0.0):
+  assert sum(list(field_size_dict.values())) == block_size, f"Total field size must be {block_size}, instead got {list(field_size_dict.values())} with sum {sum(list(field_size_dict.values()))}"
   field_length_str = '_'.join(
       [f'{k}{v}' for k, v in field_size_dict.items()])
   if wrap:
@@ -348,6 +348,7 @@ def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
 
   EOS = tokenizer.encode(tokenizer.eos_token)[0]
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
+  print(f"EOS is {EOS}, BOS is {BOS}\n************************************")
   def preprocess_and_tokenize(example, field, max_field_length):
     text = example[field]
       
@@ -395,28 +396,28 @@ def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
     tokenized_datasets_by_field[field] = tokenized_dataset
   
   tokenized_dataset = ConcatenatedDataset(
-    tokenized_datasets_by_field)
+    tokenized_datasets_by_field,
+    p_random=p_random)
   torch.save(tokenized_dataset, _path)
   return tokenized_dataset
 
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None, p_random=0.0):
   
   if 'aligned' in dataset_name:
     assert field_size_dict is not None, f"field_size_dict must be provided for {dataset_name} dataset"
     return get_summeval_dataset(
       dataset_name, tokenizer, wrap, mode, cache_dir,
-      field_size_dict=field_size_dict, block_size=block_size, num_proc=num_proc, streaming=streaming)
-
+      field_size_dict=field_size_dict, block_size=block_size, num_proc=num_proc, streaming=streaming, p_random=p_random)
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
   
-  if utils.fsspec_exists(_path):
+  if utils.fsspec_exists(_path) and False:
     LOGGER.info(f'Loading data from: {_path}')
     return datasets.load_from_disk(_path).with_format('torch')
   LOGGER.info(f'Generating new data at: {_path}')
@@ -486,6 +487,11 @@ def get_dataset(
   if dataset_name in ['lambada', 'openwebtext-train',
                       'openwebtext-valid']:
     data = dataset
+  elif 'Genomic' in dataset_name:
+    if mode == 'validation':
+      return dataset['test']
+    else:
+      data = dataset[mode]
   else:
     data = dataset[mode]
 
@@ -512,6 +518,10 @@ def get_dataset(
   EOS = tokenizer.encode(tokenizer.eos_token)[0]
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
 
+  if "Genomic" in dataset_name:
+    num_classes = np.unique(data['label']).shape[0]
+    encoding_length = int(np.ceil(np.log(num_classes) / np.log(4)))
+
   def preprocess_and_tokenize(example):
     if dataset_name == 'ptb':
       text = example['sentence']
@@ -519,6 +529,22 @@ def get_dataset(
       text = example['article']
     if detokenizer is not None:
       text = _apply_detokenizer(detokenizer)(text)
+    if 'Genomic' in dataset_name:
+      text = example['seq']
+      label = example['label']
+      label_to_id = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+      def get_label(lbl):
+        if np.random.rand() < p_random:
+          lbl = np.random.randint(0, num_classes)
+        lbl_enc = ''
+        while lbl > 0:
+          lbl_enc = label_to_id[lbl % 4] + lbl_enc
+          lbl = lbl // 4
+        if len(lbl_enc) < encoding_length:
+          lbl_enc = 'A' * (encoding_length - len(lbl_enc)) + lbl_enc
+        return lbl_enc
+      label = list(map(get_label, label)) + ['[SEP]']
+      text = list(map(lambda x: f'{x[0]}{x[1]}', zip(label, text)))
 
     tokenizer.padding_side = 'right'
     tokenizer.truncation_side = 'right'
@@ -569,6 +595,10 @@ def get_dataset(
   elif 'multi_news' in dataset_name:
     tokenized_dataset = tokenized_dataset.remove_columns(
       ['document', 'summary'])
+  elif 'Genomic' in dataset_name:
+    tokenized_dataset = tokenized_dataset.remove_columns(
+      ['seq', 'label'])
+    setattr(tokenized_dataset, 'var_indices', [list(range(encoding_length)), list(range(encoding_length, block_size))])
   else:
     tokenized_dataset = tokenized_dataset.remove_columns(
       'text')
@@ -612,7 +642,7 @@ def get_tokenizer(config):
       from_pretrained('bert-base-uncased')
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      config.data.tokenizer_name_or_path, trust_remote_code=True)
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):
@@ -658,10 +688,13 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      field_size_dict=field_size_dict,)
+      field_size_dict=field_size_dict,
+      p_random=config.data.p_random,)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
+  elif 'Genomic' in config.data.valid:
+    validation_split = 'train'
   else:
     validation_split = 'validation'
   if skip_valid:
@@ -679,7 +712,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       field_size_dict=field_size_dict,
-      streaming=False,)
+      streaming=False,
+      p_random=config.data.p_random)
 
   if skip_train:
     train_loader = None
@@ -712,7 +746,6 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       valid_loader = InfiniteDataLoader(valid_loader)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
-
   return train_loader, valid_loader
 
 class InfiniteDataLoader:
@@ -734,9 +767,10 @@ class InfiniteDataLoader:
       return self.dataloader.dataset
 
 class ConcatenatedDataset(torch.utils.data.Dataset):
-    def __init__(self, datasets):
+    def __init__(self, datasets, p_random=0.0):
         self.datasets = datasets
         self._var_indices = None
+        self.p_random = p_random
 
     def __len__(self):
         return len(next(iter(self.datasets.values())))
@@ -745,7 +779,11 @@ class ConcatenatedDataset(torch.utils.data.Dataset):
         input_ids_list = []
         attention_mask_list = []
 
-        for dataset in self.datasets.values():
+        for i, dataset in enumerate(self.datasets.values()):
+            if i > 0 and np.random.rand() < self.p_random:
+              random_idx = torch.randint(
+              low=0, high=len(dataset), size=(1,)).item()
+              idx = random_idx
             item = dataset[idx]
             input_ids_list.extend(item['input_ids'])
             if 'attention_mask' in item:

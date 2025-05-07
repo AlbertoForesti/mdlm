@@ -17,6 +17,7 @@ T: 0  # 0 (continuous time) / 1000
 subs_masking: False
 train_marginal: True
 variant: "c"
+variant_c_target: 0 # It use P(target|other)/P(target) for MI estimate - not used for j variant
 compute_accuracy:
   target_variable: 0
 

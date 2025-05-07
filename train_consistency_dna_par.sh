@@ -50,6 +50,7 @@ for p in "${p_values[@]}"; do
     echo "Starting run with p_random = $p on device $device"
     python main.py --config-name=config_genomics \
       mode=train \
+      variant=j \
       noise=loglinear \
       model=caduceus1k \
       lr_scheduler=constant \
@@ -71,8 +72,8 @@ for p in "${p_values[@]}"; do
       optim.lr=1e-3 \
       strategy.device=$device \
       data.p_random=$p \
-      wandb.notes="Caduceus 1k consistency infonce" \
-      wandb.group="consistency_dna_infosedd_debug_accuracy_23_04_2025" > "output_logs/${current_date}/log_consistency_dna_infosedd_debug_accuracy_prandom=${p}_device_${device}.txt" 2>&1
+      wandb.notes="Caduceus 1k consistency infosedd j" \
+      wandb.group="consistency_dna_infosedd_j_23_04_2025" > "output_logs/${current_date}/log_consistency_dna_infosedd_j_prandom=${p}_device_${device}.txt" 2>&1
     echo "Completed run with p_random = $p on device $device"
   ) &
   

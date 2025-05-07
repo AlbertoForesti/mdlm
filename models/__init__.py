@@ -5,3 +5,4 @@ from . import ema
 from . import autoregressive
 from . import mlp
 from . import mine
+from . import knife

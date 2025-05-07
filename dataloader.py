@@ -404,7 +404,7 @@ def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None, p_random=0.0):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None, p_random=0.0, seq_to_seq_exp=False):
   
   if 'aligned' in dataset_name:
     assert field_size_dict is not None, f"field_size_dict must be provided for {dataset_name} dataset"
@@ -520,7 +520,16 @@ def get_dataset(
 
   if "Genomic" in dataset_name:
     num_classes = np.unique(data['label']).shape[0]
-    encoding_length = int(np.ceil(np.log(num_classes) / np.log(4)))
+    if seq_to_seq_exp:
+      encoding_length = block_size // 2 - 1
+    else:
+      encoding_length = int(np.ceil(np.log(num_classes) / np.log(4)))
+    if seq_to_seq_exp:
+      indices_by_class = {}
+      for idx, lbl in enumerate(data['label']):
+        if lbl not in indices_by_class:
+          indices_by_class[lbl] = []
+        indices_by_class[lbl].append(idx)
 
   def preprocess_and_tokenize(example):
     if dataset_name == 'ptb':
@@ -533,18 +542,33 @@ def get_dataset(
       text = example['seq']
       label = example['label']
       label_to_id = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-      def get_label(lbl):
+      def get_label_or_seq(lbl):
         if np.random.rand() < p_random:
           lbl = np.random.randint(0, num_classes)
-        lbl_enc = ''
-        while lbl > 0:
-          lbl_enc = label_to_id[lbl % 4] + lbl_enc
-          lbl = lbl // 4
-        if len(lbl_enc) < encoding_length:
-          lbl_enc = 'A' * (encoding_length - len(lbl_enc)) + lbl_enc
-        return lbl_enc
-      label = list(map(get_label, label)) + ['[SEP]']
+        if seq_to_seq_exp:
+          indices_with_lbl = indices_by_class[lbl]
+          try:
+            random_idx = np.random.randint(
+              0, len(indices_with_lbl), size=(1,)).item()
+          except:
+            raise ValueError(f"indices_by_class: {indices_by_class}, lbl: {lbl}, indices_with_lbl: {indices_with_lbl}")
+          seq = data['seq'][indices_with_lbl[random_idx]]
+          if len(seq) < encoding_length:
+            seq = seq + (tokenizer.pad_token * (encoding_length - len(seq)))
+          else:
+            seq = seq[:encoding_length]
+          return seq
+        else:
+          lbl_enc = ''
+          while lbl > 0:
+            lbl_enc = label_to_id[lbl % 4] + lbl_enc
+            lbl = lbl // 4
+          if len(lbl_enc) < encoding_length:
+            lbl_enc = 'A' * (encoding_length - len(lbl_enc)) + lbl_enc
+          return lbl_enc
+      label = list(map(get_label_or_seq, label)) + ['[SEP]']
       text = list(map(lambda x: f'{x[0]}{x[1]}', zip(label, text)))
+
 
     tokenizer.padding_side = 'right'
     tokenizer.truncation_side = 'right'
@@ -599,6 +623,7 @@ def get_dataset(
     tokenized_dataset = tokenized_dataset.remove_columns(
       ['seq', 'label'])
     setattr(tokenized_dataset, 'var_indices', [list(range(encoding_length)), list(range(encoding_length, block_size))])
+    print(f"var_indices: {tokenized_dataset.var_indices}")
   else:
     tokenized_dataset = tokenized_dataset.remove_columns(
       'text')
@@ -689,7 +714,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       field_size_dict=field_size_dict,
-      p_random=config.data.p_random,)
+      p_random=config.data.p_random,
+      seq_to_seq_exp=config.data.seq_to_seq_exp,)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -713,7 +739,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       block_size=config.model.length,
       field_size_dict=field_size_dict,
       streaming=False,
-      p_random=config.data.p_random)
+      p_random=config.data.p_random,
+      seq_to_seq_exp=config.data.seq_to_seq_exp)
 
   if skip_train:
     train_loader = None

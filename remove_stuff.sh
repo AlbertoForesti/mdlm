@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Directory to process
-TARGET_DIR="/home/foresti/mdlm/outputs/home/foresti/mdlm/model_summaries_cleaned/M22/outputs_cnndm.aligned.paired.jsonl"
+TARGET_DIR="/home/foresti"
 
 # Check if directory exists
 if [ ! -d "$TARGET_DIR" ]; then

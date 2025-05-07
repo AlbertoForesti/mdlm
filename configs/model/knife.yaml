@@ -1,0 +1,25 @@
+# Configuration file for KNIFE model
+
+# Basic model parameters
+name: knife
+length: 1024
+
+hidden_size_knife: 16
+
+# Feed Forward network configuration
+ff_residual_connection: true  # Whether to use residual connections in FF layers
+ff_layers: 2  # Number of hidden layers in FF networks
+ff_layer_norm: true  # Whether to use layer normalization
+ff_activation: "relu"  # Activation function: "relu" or "tanh"
+
+# Marginal kernel parameters
+optimize_mu: true  # Whether to optimize the means of the kernel
+marg_modes: 4  # Number of modes for marginal distribution
+use_tanh: true  # Whether to apply tanh to logvar
+init_std: 0.1  # Standard deviation for parameter initialization
+cov_diagonal: "var"  # Type of covariance diagonal: "var" for variable
+cov_off_diagonal: "var"  # Type of off-diagonal terms: "var" or null
+average: "var"  # Weighted average type: "var" for learnable weights
+
+# Conditional kernel parameters
+cond_modes: 4  # Number of modes for conditional distribution

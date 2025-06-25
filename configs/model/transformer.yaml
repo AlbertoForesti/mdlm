@@ -1,11 +1,10 @@
-name: dimamba
-type: dimamba
+name: tiny
+type: transformer
 hidden_size: 64
-cond_dim: 8
+cond_dim: 16
 length: 2048
 n_blocks: 4
-n_heads: 2
+n_heads: 4
 scale_by_sigma: True
 dropout: 0.1
-temb_strategy: null 
 tie_word_embeddings: False

@@ -11,7 +11,7 @@ defaults:
 mode: train  # train / ppl_eval / sample_eval / info_eval
 diffusion: absorbing_state
 backbone: hf_dit  # dit / dimamba / ar / unetmlp / hf_dit / llada
-parameterization: sedd  # subs / d3pm / sedd
+parameterization: subs  # subs / d3pm / sedd
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
@@ -54,6 +54,7 @@ training:
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  original_model_path: kuleshov-group/caduceus-ph_seqlen-1k_d_model-256_n_layer-4_lr-8e-3
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8

@@ -50,15 +50,15 @@ class KNIFE(nn.Module):
         self.kernel_marg = MargKernel(self.args, self.args.hidden_size_knife, self.args.hidden_size_knife)
         self.kernel_cond = CondKernel(self.args, self.args.hidden_size_knife, self.args.hidden_size_knife)
 
-    def forward(self, x_marginal, x_conditional, dummy_sigma):  # samples have shape [sample_size, dim]
-        z_c = self.backbone(x_conditional, dummy_sigma)
-        z_d = self.backbone(x_marginal, dummy_sigma)
+    def forward(self, x, y, dummy_sigma):  # samples have shape [sample_size, dim]
+        
+        # print("y", y[:5], "x", x[:5])
         if isinstance(self.backbone, transformers.PreTrainedModel):
-            z_c = self.backbone(x_conditional, dummy_sigma, output_hidden_states=True, return_dict=True).hidden_states[-1]
-            z_d = self.backbone(x_marginal, dummy_sigma, output_hidden_states=True, return_dict=True).hidden_states[-1]
+            z_c = self.backbone(y, dummy_sigma, output_hidden_states=True, return_dict=True).hidden_states[-1]
+            z_d = self.backbone(x, dummy_sigma, output_hidden_states=True, return_dict=True).hidden_states[-1]
         else:
-            z_c = self.backbone(x_conditional, dummy_sigma)
-            z_d = self.backbone(x_marginal, dummy_sigma)
+            z_c = self.backbone(y, dummy_sigma)
+            z_d = self.backbone(x, dummy_sigma)
         z_c = self.pooling(z_c)
         z_d = self.pooling(z_d)
         

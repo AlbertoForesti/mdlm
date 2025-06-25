@@ -404,7 +404,7 @@ def get_summeval_dataset(dataset_name, tokenizer, wrap, mode, cache_dir,
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None, p_random=0.0, seq_to_seq_exp=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, field_size_dict=None, p_random=0.0, seq_to_seq_exp=False, data_config=None):
   
   if 'aligned' in dataset_name:
     assert field_size_dict is not None, f"field_size_dict must be provided for {dataset_name} dataset"
@@ -478,6 +478,8 @@ def get_dataset(
       'ag_news',
       cache_dir=cache_dir,
       streaming=streaming)
+  elif 'Arabidopsis' in dataset_name:
+    dataset = datasets.load_from_disk(dataset_name)
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -541,6 +543,9 @@ def get_dataset(
     if 'Genomic' in dataset_name:
       text = example['seq']
       label = example['label']
+      if "Arabidopsis" in dataset_name:
+        assert label == example['is_promoter'], f"label: {label}, is_promoter: {example['is_promoter']}"
+
       label_to_id = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
       def get_label_or_seq(lbl):
         if np.random.rand() < p_random:
@@ -566,7 +571,7 @@ def get_dataset(
           if len(lbl_enc) < encoding_length:
             lbl_enc = 'A' * (encoding_length - len(lbl_enc)) + lbl_enc
           return lbl_enc
-      label = list(map(get_label_or_seq, label)) + ['[SEP]']
+      label = list(map(get_label_or_seq, label))
       text = list(map(lambda x: f'{x[0]}{x[1]}', zip(label, text)))
 
 
@@ -622,6 +627,9 @@ def get_dataset(
   elif 'Genomic' in dataset_name:
     tokenized_dataset = tokenized_dataset.remove_columns(
       ['seq', 'label'])
+    if "Arabidopsis" in dataset_name:
+      tokenized_dataset = tokenized_dataset.remove_columns(
+        ['description', 'gene_id', 'is_promoter', 'fp_id', 'range_info'])
     setattr(tokenized_dataset, 'var_indices', [list(range(encoding_length)), list(range(encoding_length, block_size))])
     print(f"var_indices: {tokenized_dataset.var_indices}")
   else:
@@ -715,12 +723,16 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       block_size=config.model.length,
       field_size_dict=field_size_dict,
       p_random=config.data.p_random,
-      seq_to_seq_exp=config.data.seq_to_seq_exp,)
+      seq_to_seq_exp=config.data.seq_to_seq_exp,
+      data_config=config.data)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
   elif 'Genomic' in config.data.valid:
-    validation_split = 'train'
+    if 'Arabidopsis' in config.data.valid and config.mode == "motif_selection":
+      validation_split = 'test'
+    else:
+      validation_split = 'train'
   else:
     validation_split = 'validation'
   if skip_valid:
@@ -740,7 +752,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       field_size_dict=field_size_dict,
       streaming=False,
       p_random=config.data.p_random,
-      seq_to_seq_exp=config.data.seq_to_seq_exp)
+      seq_to_seq_exp=config.data.seq_to_seq_exp,
+      data_config=config.data)
 
   if skip_train:
     train_loader = None
@@ -775,23 +788,96 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     valid_loader.tokenizer = tokenizer
   return train_loader, valid_loader
 
+class MaskedDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that applies masking to specific token positions"""
+    
+    def __init__(self, dataset, mask_indices, mask_token_id):
+        """
+        Args:
+            dataset: The original dataset
+            mask_indices: List of indices to mask in the input_ids
+            mask_token_id: Token ID to use for masking
+        """
+        self.dataset = dataset
+        self.mask_indices = mask_indices
+        self.mask_token_id = mask_token_id
+        # Preserve any additional attributes from the original dataset
+        self._var_indices = getattr(dataset, 'var_indices', None)
+        self._var_indices[0] = list(
+            set(self._var_indices[0]) - set(self.mask_indices) - set(range(252,1030)))
+        self._var_indices[1] = list(
+            set(self._var_indices[1]) - set(self.mask_indices) - set(range(252,1030)))
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        # Get the original item
+        item = self.dataset[idx]
+        
+        # Create a copy of input_ids to avoid modifying the original
+        input_ids = item['input_ids'].clone()
+
+        # Apply masking
+        for idx in self.mask_indices:
+            if idx < len(input_ids):
+                input_ids[idx] = self.mask_token_id
+        
+        ret = {**item, 'input_ids': input_ids}
+        # Return the modified item
+        # raise UserWarning(f"label: {input_ids[0]}, seq: {input_ids[1:]}, mask_indices: {self.mask_indices}, var_indices: {self._var_indices}")
+        return ret
+    
+    @property
+    def var_indices(self):
+        return self._var_indices
+
+
+# Modify InfiniteDataLoader to accept mask_indices and apply masking
 class InfiniteDataLoader:
-  def __init__(self, dataloader):
-      self.dataloader = dataloader
-      self.iterator = cycle(dataloader)
+    def __init__(self, dataloader, mask_indices=None, mask_token_id=None):
+        """
+        Args:
+            dataloader: The original dataloader
+            mask_indices: Optional list of indices to mask in input_ids
+            mask_token_id: Token ID to use for masking
+        """
+        if isinstance(dataloader, InfiniteDataLoader):
+            dataloader = dataloader.dataloader
 
-  def __iter__(self):
-      return self
+        if mask_indices is not None and mask_token_id is not None:
+            # Wrap the dataset with masking
+            masked_dataset = MaskedDataset(
+                dataloader.dataset, 
+                mask_indices,
+                mask_token_id
+            )
+            # Create a new dataloader with the masked dataset
+            self.dataloader = torch.utils.data.DataLoader(
+                masked_dataset,
+                batch_size=dataloader.batch_size,
+                num_workers=dataloader.num_workers,
+                collate_fn=dataloader.collate_fn,
+                pin_memory=getattr(dataloader, 'pin_memory', False)
+            )
+        else:
+            # Use the original dataloader
+            self.dataloader = dataloader
+            
+        self.iterator = cycle(self.dataloader)
 
-  def __next__(self):
-      return next(self.iterator)
-  
-  def __len__(self):
-      return np.inf
-  
-  @property
-  def dataset(self):
-      return self.dataloader.dataset
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.iterator)
+    
+    def __len__(self):
+        return np.inf
+    
+    @property
+    def dataset(self):
+        return self.dataloader.dataset
 
 class ConcatenatedDataset(torch.utils.data.Dataset):
     def __init__(self, datasets, p_random=0.0):
@@ -880,6 +966,11 @@ def get_synthetic_dataloaders(config, tokenizer):
   else:
     xy_train = (torch.tensor(outputs, dtype=torch.long),)
   
+  xy_valid = (xy_train[0][:config.data.train_size // 5], 
+              xy_train[1][:config.data.train_size // 5])
+  xy_train = (xy_train[0][config.data.train_size // 5:],
+              xy_train[1][config.data.train_size // 5:])
+
   train_loader = torch.utils.data.DataLoader(
     SyntheticDataset(xy_train),
     batch_size=config.loader.batch_size,
@@ -889,7 +980,7 @@ def get_synthetic_dataloaders(config, tokenizer):
   train_loader.tokenizer = tokenizer
 
   valid_loader = torch.utils.data.DataLoader(
-    SyntheticDataset(xy_train),
+    SyntheticDataset(xy_valid),
     batch_size=config.loader.eval_batch_size,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory,

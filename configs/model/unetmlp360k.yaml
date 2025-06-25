@@ -1,10 +1,10 @@
-name: unetmlp007k
+name: unetmlp070k
 type: unetmlp
 dropout: 0     # Keeping dropout the same
-resnet_block_groups: 4
+resnet_block_groups: 8
 length: ${model_length:${data.random_variable.seq_length}}
-sigma_dim: 1
-init_dim: 4
+sigma_dim: 64
+init_dim: 128
 hidden_size: ${model.init_dim}
 scaling_factor: null
 is_parametric_marginal: false

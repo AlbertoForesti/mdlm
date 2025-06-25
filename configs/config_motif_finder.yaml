@@ -1,45 +1,40 @@
 defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
-  - /data: synthetic
-  - /model: dimamba
+  - /data: Genomic
+  - /model: medium
   - /strategy: ddp
-  - /noise: geometric
-  - /lr_scheduler: cosine_hard_restart_warmup
+  - /noise: loglinear
+  - /lr_scheduler: constant_warmup
   - /mine_loss: DonskerVaradhan
 
-mode: train  # train / ppl_eval / sample_eval / info_eval
+mode: motif_selection  # train / ppl_eval / sample_eval / info_eval
 diffusion: absorbing_state
-backbone: dimamba  # dit / dimamba / ar / unetmlp / hf_dit / llada
+backbone: hf_dit  # dit / dimamba / ar / unetmlp / hf_dit / llada
 parameterization: subs  # subs / d3pm / sedd
-time_conditioning: True
+time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
 train_marginal: True
-variant_c_target: 0
-compute_accuracy: False
 variant: "j"
-
+box_length: 20
+variant_c_target: 0 # It use P(target|other)/P(target) for MI estimate - not used for j variant
+compute_accuracy:
+  target_variable: 0
+lower_bound: 165
+upper_bound: 200
+mask_type: "keep" # remove / keep
 
 seed: 42
-
-dora:
-  enabled: false
-  r: 8  # Low-rank dimension
-  alpha: 16  # Scaling factor
-  dropout: 0.0
-  bias: "none"  # Can be "none", "all", or "lora_only"
-  target_modules: ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
-  modules_to_save: null
 
 loader:
   global_batch_size: 128
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
-  batch_size: 128
-  eval_batch_size: 128 # ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: 16
-  pin_memory: False
+  batch_size: ${.global_batch_size}
+  eval_batch_size: ${.global_batch_size} # ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  num_workers: 1
+  pin_memory: True
 
 sampling:
   predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
@@ -53,29 +48,30 @@ sampling:
   num_strides: 1
 
 training:
-  ema: 0.999
+  ema: 0.9999
   antithetic_sampling: True
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
-  compute_entropy: False
+  compute_entropy: True
   compute_mutinfo: True
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  original_model_path: kuleshov-group/caduceus-ph_seqlen-1k_d_model-256_n_layer-4_lr-8e-3
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
-  generate_samples: False
-  mc_estimates: 100
-  compute_entropy: False
+  generate_samples: True
+  mc_estimates: 10
+  compute_entropy: True
   compute_mutinfo: True
 
 optim:
-  weight_decay: 0
-  lr: 4e-4
+  weight_decay: 0.1
+  lr: 2e-3
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -85,16 +81,15 @@ trainer:
   accelerator: cuda
   num_nodes: 1
   devices: ${device_count:}
-  accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  accumulate_grad_batches: 1
   gradient_clip_val: 1.0
   precision: 'bf16' # bf16
   num_sanity_val_steps: 2
-  max_steps: 10_000_000
-  log_every_n_steps: 10
+  max_steps: 20_000
+  log_every_n_steps: 1
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 5000
-  check_val_every_n_epoch: null
+  check_val_every_n_epoch: 1
 
 wandb:
   project: text-diffusion
@@ -109,7 +104,7 @@ hydra:
     dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
   sweep:  # Add this section
     dir: ./multirun/${now:%Y.%m.%d}/${now:%H%M%S}
-    subdir: run_${hydra.job.num}_${get_data_key:${data}}
+    subdir: run_${hydra.job.num}
   job:
     chdir: true
   
@@ -119,8 +114,13 @@ checkpointing:
   save_dir: ${cwd:}
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
-  resume_ckpt_path: null
+  resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
 
-loss:
-  _target_: torchkld.loss.DonskerVaradhanLoss
-  ema_multiplier: 1e-2
+dora:
+  enabled: true
+  r: 8  # Low-rank dimension
+  alpha: 16  # Scaling factor
+  dropout: 0.0
+  bias: "none"  # Can be "none", "all", or "lora_only"
+  target_modules: ["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"]
+  modules_to_save: null

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Directory to process
-TARGET_DIR="/home/foresti"
+TARGET_DIR="/home/foresti/mdlm"
 
 # Check if directory exists
 if [ ! -d "$TARGET_DIR" ]; then

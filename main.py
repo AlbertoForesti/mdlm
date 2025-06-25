@@ -15,6 +15,9 @@ import utils
 
 from hydra.utils import instantiate
 from datetime import datetime
+from copy import deepcopy
+from tqdm import tqdm
+
 import numpy as np
 
 omegaconf.OmegaConf.register_new_resolver(
@@ -107,46 +110,8 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('ids:', last)
 
 
-def generate_samples(config, logger, tokenizer):
-  logger.info('Generating samples.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
-  model.gen_ppl_metric.reset()
-  if config.eval.disable_ema:
-    logger.info('Disabling EMA.')
-    model.ema = None
-  stride_length = config.sampling.stride_length
-  num_strides = config.sampling.num_strides
-  for _ in range(config.sampling.num_sample_batches):
-    if config.sampling.semi_ar:
-      _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
-        stride_length=stride_length,
-        num_strides=num_strides,
-        dt=1 / config.sampling.steps)
-      text_samples = intermediate_samples[-1]
-      # Note: Samples generated using semi-ar method
-      # need to to be processed before computing generative perplexity
-      # since these samples contain numerous <|endoftext|> tokens
-      # and diffusion.compute_generative_perplexity() discards
-      # any text after the first EOS token.
-    else:
-      samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps)
-      text_samples = model.tokenizer.batch_decode(samples)
-      model.compute_generative_perplexity(text_samples)
-  print('Text samples:', text_samples)
-  if not config.sampling.semi_ar:
-    print('Generative perplexity:',
-          model.gen_ppl_metric.compute())
-  return text_samples
-
-def info_eval(config, logger, tokenizer):
+def mutinfo_eval(config, logger, tokenizer):
   logger.info('Starting Information Metrics Eval.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
-  if config.eval.disable_ema:
-    logger.info('Disabling EMA.')
-    model.ema = None
 
   wandb_logger = None
   if config.get('wandb', None) is not None:
@@ -157,6 +122,18 @@ def info_eval(config, logger, tokenizer):
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
       callbacks.append(hydra.utils.instantiate(callback))
+  
+  _, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer, skip_train=True, valid_seed=config.seed)
+  if hasattr(valid_ds.dataset, 'var_indices'):
+    # If dataset has var_indices, pass them to the model config
+    if omegaconf.OmegaConf.select(config, "mutinfo") is not None:
+        omegaconf.OmegaConf.update(config.mutinfo, "var_indices", valid_ds.dataset.var_indices, force_add=True)
+    else:
+        omegaconf.OmegaConf.update(config, "mutinfo.var_indices", valid_ds.dataset.var_indices, force_add=True)
+  else:
+    omegaconf.OmegaConf.update(config, "mutinfo.var_indices", valid_ds.dataset.var_indices, force_add=True)
+    omegaconf.OmegaConf.update(config, "mutinfo._var_indices", valid_ds.dataset.var_indices, force_add=True)
   trainer = hydra.utils.instantiate(
     config.trainer,
     default_root_dir=os.getcwd(),
@@ -164,37 +141,101 @@ def info_eval(config, logger, tokenizer):
     strategy=hydra.utils.instantiate(config.strategy),
     logger=wandb_logger,
     limit_val_batches=config.eval.mc_estimates)
-  _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
-  trainer.validate(model, valid_ds)
-
-def _ppl_eval(config, logger, tokenizer):
-  logger.info('Starting Zero Shot Eval.')
-
   model = _load_from_checkpoint(config=config,
                                 tokenizer=tokenizer)
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
-
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
-  callbacks = []
-  if 'callbacks' in config:
-    for _, callback in config.callbacks.items():
-      callbacks.append(hydra.utils.instantiate(callback))
-  trainer = hydra.utils.instantiate(
-    config.trainer,
-    default_root_dir=os.getcwd(),
-    callbacks=callbacks,
-    strategy=hydra.utils.instantiate(config.strategy),
-    logger=wandb_logger)
-  _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
+  mutinfo_estimate = float(model.valid_mutinfo)
+  mutinfo_std = float(model.valid_mutinfo_std)
+  print(f"Mutual information estimate: {mutinfo_estimate} +/- {mutinfo_std}")
+
+def motif_selection(config, logger, tokenizer):
+  logger.info('Starting Motif Selection.')
+  
+  lower_bound = config.lower_bound
+  upper_bound = config.upper_bound
+  start = max(0, lower_bound)
+  end = max(min(252-config.box_length, upper_bound),start+1)
+  mutinfos = []
+  mutinfos_std = []
+  accs = []
+  for i in tqdm(range(start,end), desc="Motif Selection"):
+
+    # This works even if the field doesn't exist yet
+    model = _load_from_checkpoint(config=config,
+                                tokenizer=tokenizer)
+    if config.eval.disable_ema:
+      logger.info('Disabling EMA.')
+      model.ema = None
+    
+    # Or completely disable
+    # logging.getLogger("pytorch_lightning").setLevel(logging.CRITICAL)
+
+    if config.mask_type == 'remove':
+      mask_indices = list(range(1+i, 1+i+config.box_length))
+    elif config.mask_type == 'keep':
+      mask_indices = list(range(1,1+i)) + list(range(1+i+config.box_length, 252))
+    else:
+      raise ValueError(f"Unknown mask type {config.mask_type}.")
+
+    omegaconf.OmegaConf.update(config.data, "mask_indeces", 
+                          mask_indices, 
+                          force_add=True)
+    
+    callbacks = []
+    if 'callbacks' in config:
+      for _, callback in config.callbacks.items():
+        callbacks.append(hydra.utils.instantiate(callback))
+    omegaconf.OmegaConf.update(config, "trainer.limit_val_batches", config.eval.mc_estimates, force_add=True)
+    _, valid_ds = dataloader.get_dataloaders(
+      config, tokenizer, skip_train=True, valid_seed=config.seed)
+    if hasattr(valid_ds.dataset, 'var_indices'):
+      # If dataset has var_indices, pass them to the model config
+      if omegaconf.OmegaConf.select(config, "mutinfo") is not None:
+          omegaconf.OmegaConf.update(config.mutinfo, "var_indices", valid_ds.dataset.var_indices, force_add=True)
+      else:
+          omegaconf.OmegaConf.update(config, "mutinfo.var_indices", valid_ds.dataset.var_indices, force_add=True)
+    else:
+      omegaconf.OmegaConf.update(config, "mutinfo.var_indices", mask_indices, force_add=True)
+      omegaconf.OmegaConf.update(config, "mutinfo._var_indices", mask_indices, force_add=True)
+    trainer = hydra.utils.instantiate(
+      config.trainer,
+      default_root_dir=os.getcwd(),
+      callbacks=callbacks,
+      strategy=hydra.utils.instantiate(config.strategy),
+      logger=None,
+      enable_progress_bar=False,
+      enable_model_summary=False,)
+
+    # Create the masked dataloader
+    masked_dataloader = dataloader.InfiniteDataLoader(
+        valid_ds,
+        mask_indices=mask_indices,
+        mask_token_id=tokenizer.mask_token_id
+    )
+
+    # Use the masked dataloader for validation
+    model.config.mutinfo.var_indices = masked_dataloader.dataset.var_indices
+    trainer.validate(model, masked_dataloader)
+    mutinfo_estimate = float(model.valid_mutinfo)
+    mutinfos.append(deepcopy(mutinfo_estimate))
+    mutinfos_std.append(deepcopy(model.valid_mutinfo_std))
+    acc = deepcopy(model.val_accuracy)
+    accs.append(acc)
+    # After trainer.validate
+    torch.cuda.synchronize(device=config.strategy.device)  # Wait for all CUDA operations to complete
+
+    # Free memory manually if needed
+    del masked_dataloader
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+  with open('/home/foresti/mdlm/motif_selection.txt', 'w') as f:
+    for i in range(end-start):
+      f.write(f"{start+i} {mutinfos[i]}, std {mutinfos_std[i]}, acc {accs[i]}\n")
+  
 
 def extract_model_id(path):
     """Extract model ID (like M7) from a path"""
@@ -250,7 +291,7 @@ def _train(config, logger, tokenizer):
     ckpt_path = config.checkpointing.resume_ckpt_path
   else:
     ckpt_path = None
-
+  
   # Lightning callbacks
   callbacks = []
   if 'callbacks' in config:
@@ -303,13 +344,10 @@ def main(config):
   
   logger = utils.get_logger(__name__)
   tokenizer = dataloader.get_tokenizer(config)
-
-  if config.mode == 'sample_eval':
-    generate_samples(config, logger, tokenizer)
-  elif config.mode == 'ppl_eval':
-    _ppl_eval(config, logger, tokenizer)
-  elif config.mode == 'info_eval':
-    info_eval(config, logger, tokenizer)
+  if config.mode == 'mutinfo_eval':
+    mutinfo_eval(config, logger, tokenizer)
+  elif config.mode == 'motif_selection':
+    motif_selection(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 

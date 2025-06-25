@@ -1,4 +1,4 @@
-name: mlp
-type: mlp
+name: reg
+type: reg
 length: ${model_length:${data.random_variable.seq_length}}
-hidden_size: 1024
+hidden_size: 32

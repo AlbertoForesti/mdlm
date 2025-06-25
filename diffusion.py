@@ -50,12 +50,6 @@ class Loss:
 class NLL(torchmetrics.aggregation.MeanMetric):
   pass
 
-class Mutinfo(torchmetrics.aggregation.MeanMetric):
-  pass
-
-class Entropy(torchmetrics.aggregation.MeanMetric):
-  pass
-
 class Accuracy(torchmetrics.aggregation.MeanMetric):
   pass
 
@@ -108,6 +102,7 @@ class Diffusion(L.LightningModule):
         self.vocab_size += 1
     else:
       self.mask_index = self.tokenizer.mask_token_id
+    
     self._init_backbone()
 
     if hasattr(config.model, "peft_config"):
@@ -136,29 +131,20 @@ class Diffusion(L.LightningModule):
           'nll': NLL(),
           'bpd': BPD(),
           'ppl': Perplexity(),
-          'mutinfo': Mutinfo(),
           'accuracy': Accuracy(),
         },
-        compute_groups=[['nll', 'bpd', 'ppl', 'mutinfo'],['accuracy']])
+        compute_groups=[['nll', 'bpd', 'ppl'],['accuracy']])
       else:
         metrics = torchmetrics.MetricCollection({
           'nll': NLL(),
           'bpd': BPD(),
           'ppl': Perplexity(),
-          'mutinfo': Mutinfo(),
         })
-    info_metrics = torchmetrics.MetricCollection({
-      'entropy': Entropy(),
-      'mutinfo': Mutinfo(),
-    })
     metrics.set_dtype(torch.float64)
     self.train_metrics = metrics.clone(prefix='train/')
     self.valid_metrics = metrics.clone(prefix='val/')
-    self.test_metrics = metrics.clone(prefix='test/')
-
-    self.train_info_metrics = info_metrics.clone(prefix='train/')
-    self.valid_info_metrics = info_metrics.clone(prefix='val/')
-    self.test_info_metrics = info_metrics.clone(prefix='test/')
+    self.train_mutinfo = 0
+    self.valid_mutinfo = []
 
     # generative perplexity
     self.gen_ppl_metric = Perplexity()
@@ -212,7 +198,10 @@ class Diffusion(L.LightningModule):
     if self.config.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
-    if self.config.backbone == 'unetmlp':
+    elif self.config.backbone == 'transformer':
+      self.backbone = models.transformer.Transformer(
+        self.config, vocab_size=self.vocab_size)
+    elif self.config.backbone == 'unetmlp':
       self.backbone = models.unetmlp.UnetMLP(
         self.config, vocab_size=self.vocab_size)
     elif self.config.backbone == 'dimamba':
@@ -226,19 +215,28 @@ class Diffusion(L.LightningModule):
         vocab_size=self.vocab_size,
         mask_index=self.mask_index)
     elif self.config.backbone == 'hf_dit':
-      try:
+      if self.config.mode == "train":
         self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         self.config.eval.checkpoint_path, trust_remote_code=True)
-      except:
-        raise ValueError(f"Could not load model from {self.config.eval.checkpoint_path}")
+      else:
+        self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
+        self.config.eval.original_model_path, trust_remote_code=True)
     elif self.config.backbone == 'llada':
       self.backbone = transformers.AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Base', trust_remote_code=True, torch_dtype=torch.bfloat16)
     elif 'caduceus' in self.config.backbone:
-       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        self.config.eval.checkpoint_path, trust_remote_code=True)
-       print(f"Loaded caduceus model from {self.config.eval.checkpoint_path}")
+      if self.config.mode == "train":
+        self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
+          self.config.eval.checkpoint_path, trust_remote_code=True)
+        print(f"Loaded caduceus model from {self.config.eval.checkpoint_path}")
+      else:
+        self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
+          self.config.eval.original_model_path, trust_remote_code=True)
     elif self.config.backbone == 'mlp':
       self.backbone = models.mlp.MLP(self.config)
+    elif self.config.backbone == 'embedding':
+      self.backbone = models.embedding.Embedding(self.config.model.hidden_size, 3) # Use only for synthetic data
+    elif self.config.backbone == 'reg':
+      self.backbone = models.linearregression.LinearRegression(self.config)
     else:
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
@@ -251,6 +249,8 @@ class Diffusion(L.LightningModule):
   def _validate_configuration(self):
     assert not (self.change_of_variables
                 and self.importance_sampling)
+    if self.config.mode != 'train':
+      return
     if self.config.eval.compute_mutinfo or self.config.training.compute_mutinfo:
       assert hasattr(self.config, 'mutinfo'), f"config: {self.config} does not have mutinfo"
       assert hasattr(self.config.mutinfo, 'var_indices')
@@ -441,10 +441,7 @@ class Diffusion(L.LightningModule):
         logits = logits[:,:,:self.vocab_size]
     else:
       with torch.cuda.amp.autocast(dtype=torch.float32):
-        try:
-          logits = self.backbone(x, self._reshape_based_on_noise(sigma, is_unet_conditioning=True))
-        except:
-          raise ValueError(f"Shapes: {x.shape}, {self._reshape_based_on_noise(sigma, is_unet_conditioning=True).shape}")
+        logits = self.backbone(x, self._reshape_based_on_noise(sigma, is_unet_conditioning=True))
     
     # print(f"x: {x[0,:20]}, mask_index: {self.mask_index}")
     if self.parameterization == 'subs':
@@ -498,9 +495,8 @@ class Diffusion(L.LightningModule):
     if self.parameterization != 'mine' and self.parameterization != 'knife':
       loss = losses.loss
       if self.config.training.compute_mutinfo:
-        info_metrics = self._compute_information_metrics(
+        mutinfo = self._compute_mutinfo(
           batch['input_ids'], prefix)
-        mutinfo = info_metrics['mutinfo']
     else:
       if self.parameterization == 'mine':
         loss = losses
@@ -511,7 +507,7 @@ class Diffusion(L.LightningModule):
     if prefix == 'train':
       if self.parameterization != 'mine' and self.parameterization != 'knife':
         if self.config.training.compute_mutinfo:
-          self.train_info_metrics['mutinfo'].update(mutinfo)
+          self.train_mutinfo = mutinfo
         # self.train_metrics.update(losses.nlls, losses.token_mask)
         self.train_metrics['nll'].update(losses.nlls)
         self.train_metrics['bpd'].update(losses.token_mask)
@@ -542,20 +538,6 @@ class Diffusion(L.LightningModule):
         else:
           raise NotImplementedError(f"Unknown parameterization: {self.parameterization}")
       metrics = self.valid_metrics
-    elif prefix == 'test':
-      if self.parameterization != 'mine' and self.parameterization != 'knife':
-        self.test_metrics['nll'].update(losses.nlls)
-        self.test_metrics['bpd'].update(losses.token_mask)
-        if self.config.compute_accuracy:
-          self.test_metrics['accuracy'].update(losses.accuracy)
-      else:
-        if self.parameterization == 'mine':
-          self.test_metrics.update(-loss)
-        elif self.parameterization == 'knife':
-          self.test_metrics.update(mutinfo)
-        else:
-          raise NotImplementedError(f"Unknown parameterization: {self.parameterization}")
-      metrics = self.test_metrics
     else:
       raise ValueError(f'Invalid prefix: {prefix}')
 
@@ -570,13 +552,11 @@ class Diffusion(L.LightningModule):
       return self.config.training
     elif prefix == 'val':
       return self.config.eval
-    elif prefix == 'test':
-      return self.config.eval
     else:
       raise ValueError(f'Invalid prefix: {prefix}')
   
   @torch.no_grad()
-  def _compute_information_metrics(self, x0, prefix):
+  def _compute_mutinfo(self, x0, prefix):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -595,39 +575,23 @@ class Diffusion(L.LightningModule):
 
     xt = self.q_xt(x0, move_chance)
 
-    info_metrics = dict()
-
     config = self._get_stage_config_from_prefix(prefix)
-    
-    if config.compute_entropy:
-      info_metrics['entropy'] = self._entropy(x0, xt, sigma, dsigma)
-    else:
-      info_metrics['entropy'] = None
 
     if config.compute_mutinfo:
-      info_metrics['mutinfo'] = self._mutinfo(x0, xt, sigma, dsigma)
-      # print(f"mutinfo: {info_metrics['mutinfo']}")
+      mutinfo = self._mutinfo(x0, xt, sigma, dsigma)
+      # print(f"mutinfo: {mutinfo}")
     else:
-      info_metrics['mutinfo'] = None
+      mutinfo = None
     
     if prefix == 'train':
-        if info_metrics["entropy"] is not None:
-            self.train_info_metrics['entropy'].update(info_metrics['entropy'])
-        if info_metrics["mutinfo"] is not None:
-            self.train_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
+        if mutinfo is not None:
+            self.train_mutinfo = mutinfo
     elif prefix == 'val':
-        if info_metrics["entropy"] is not None:
-            self.valid_info_metrics['entropy'].update(info_metrics['entropy'])
-        if info_metrics["mutinfo"] is not None:
-            self.valid_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
-    elif prefix == 'test':
-        if info_metrics["entropy"] is not None:
-            self.test_info_metrics['entropy'].update(info_metrics['entropy'])
-        if info_metrics["mutinfo"] is not None:
-            self.test_info_metrics['mutinfo'].update(info_metrics['mutinfo'])
+        if mutinfo is not None:
+            self.valid_mutinfo.append(mutinfo)
     else:
         raise NotImplementedError(f'Invalid prefix: {prefix}')
-    return info_metrics
+    return mutinfo
 
   @torch.no_grad()
   def _entropy(self, x0, xt, sigma, dsigma):
@@ -769,10 +733,10 @@ class Diffusion(L.LightningModule):
 
     if self.parameterization == 'mine':
       mine_loss = self._mine_loss(x0)
-      return -mine_loss
+      return -mine_loss.mean().item()
     
     if self.parameterization == 'knife':
-      return self._knife_loss(x0)['mi']
+      return self._knife_loss(x0)['mi'].mean().item()
     
     torch.cuda.empty_cache()
 
@@ -788,6 +752,14 @@ class Diffusion(L.LightningModule):
       log_score_joint = self.get_score_with_signal(xt, sigma, joint_signal, return_logscore=True)
       x_mask_score_shape_broadcast = x_mask.unsqueeze(-1).expand_as(log_score_marginal_x)
       log_score_marginal = torch.where(x_mask_score_shape_broadcast, log_score_marginal_x, log_score_marginal_y)
+      all_var_indices = []
+      for i in range(len(self.config.mutinfo.var_indices)):
+        all_var_indices += self.config.mutinfo.var_indices[i]
+      all_var_indices = torch.tensor(all_var_indices).to(x0.device)
+      # raise UserWarning(f"all_var_indices: {all_var_indices}, log_score_marginal: {log_score_marginal.shape}, log_score_joint: {log_score_joint.shape}")
+      log_score_marginal = log_score_marginal[:,all_var_indices]
+      log_score_joint = log_score_joint[:,all_var_indices]
+      xt = xt[:,all_var_indices]
       del x0, x_mask, y_mask, xt_marginal_x, xt_marginal_y, log_score_marginal_x, log_score_marginal_y
       mutinfo = self._score_divergence(log_score_joint, log_score_marginal, dsigma[:,None], xt)
 
@@ -849,6 +821,7 @@ class Diffusion(L.LightningModule):
   @torch.no_grad()
   def on_validation_epoch_start(self):
     torch.cuda.empty_cache()
+    self.valid_mutinfo = []
     if self.ema:
       self.ema.store(self.get_params())
       self.ema.copy_to(self.get_params())
@@ -862,10 +835,10 @@ class Diffusion(L.LightningModule):
   def validation_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='val')
     torch.cuda.empty_cache() # Frees reserved memory
-    info_metrics = self._compute_information_metrics(batch['input_ids'], prefix='val')
+    mutinfo = self._compute_mutinfo(batch['input_ids'], prefix='val')
     return {
       'loss': loss,
-      **info_metrics
+      'mutinfo': mutinfo
     }
 
   @torch.no_grad()
@@ -898,18 +871,16 @@ class Diffusion(L.LightningModule):
                 on_epoch=True,
                 on_step=False,
                 sync_dist=True)
-    if self.config.eval.compute_entropy:
-      self.log('val/entropy',
-                self.valid_info_metrics['entropy'].compute(),
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True)
     if self.config.eval.compute_mutinfo:
+      self.valid_mutinfo_std = np.std(self.valid_mutinfo)
+      self.valid_mutinfo = np.mean(self.valid_mutinfo)
       self.log('val/mutinfo',
-                self.valid_info_metrics['mutinfo'].compute(),
+                self.valid_mutinfo,
                 on_epoch=True,
                 on_step=False,
                 sync_dist=True)
+    if self.config.compute_accuracy:
+      self.val_accuracy = self.valid_metrics['accuracy'].compute()
     if self.ema:
       self.ema.restore(self.get_params())
     torch.cuda.empty_cache()
@@ -1357,6 +1328,7 @@ class Diffusion(L.LightningModule):
     dummy_sigma = torch.zeros(x0.shape[0], device=x0.device)
     dummy_sigma = self._reshape_based_on_noise(dummy_sigma, True)
     critic_joint = self.backbone(x0, dummy_sigma)
+    
     mask_y = self._get_mask_from_list_of_indices(x0, self.config.mutinfo.var_indices[1])
     x0_marginal = x0.clone()
     if not isinstance(self._loss_fn, (torchkld.loss.InfoNCELoss, torchkld.loss.nce.InfoNCELoss)):
@@ -1373,10 +1345,8 @@ class Diffusion(L.LightningModule):
 
       dummy_sigma = torch.zeros(x0_marginal.shape[0], device=x0_marginal.device)
       dummy_sigma = self._reshape_based_on_noise(dummy_sigma, True)
-
     critic_marginal = self.backbone(x0_marginal, dummy_sigma)
     loss = self._loss_fn(critic_joint, critic_marginal)
-    # print(f"loss: {loss.item()}")
     return loss
   
   def _knife_loss(self, x0):
@@ -1386,7 +1356,9 @@ class Diffusion(L.LightningModule):
     dummy_sigma = self._reshape_based_on_noise(dummy_sigma, True)
     # print(f"selected_mask: {selected_mask}, x_mask: {x_mask[0,:10]}, masked_batch: {masked_batch[0,:10]}")
     x0_marginal = torch.where(x_mask, x0, masked_batch)
-    mi, marg_ent, cond_ent = self.backbone(x0_marginal, x0, dummy_sigma)
+    y0_marginal = torch.where(x_mask, masked_batch, x0)
+    mi, marg_ent, cond_ent = self.backbone(x0_marginal, y0_marginal, dummy_sigma)
+    # print(f"mi: {mi.mean().item()}, marg_ent: {marg_ent.mean().item()}, cond_ent: {cond_ent.mean().item()}")
     return {'loss': marg_ent + cond_ent, 'mi': mi, 'marg_ent': marg_ent, 'cond_ent': cond_ent}
   
   def _forward_pass_diffusion(self, x0):
